@@ -168,8 +168,9 @@ async def forward_request(
         headers["X-User-Email"] = user.email
         headers["X-User-Tier"] = user.subscription_tier.value
     
-    # Remove host header to avoid conflicts
+    # Remove headers that cause conflicts
     headers.pop("host", None)
+    headers.pop("content-length", None)  # Let httpx calculate this
     
     # Prepare request data
     url = f"{service_url}{path}"
@@ -298,6 +299,12 @@ async def notifications_proxy(
 async def webhooks_proxy(request: Request, path: str):
     """Proxy webhook requests to notification service."""
     return await forward_request(request, NOTIFICATION_SERVICE_URL, f"/webhooks/{path}")
+
+# Public video providers endpoint (no auth required)
+@app.get("/api/v1/videos/providers-public")
+async def video_providers_public(request: Request):
+    """Get available video providers (no authentication required)."""
+    return await forward_request(request, VIDEO_SERVICE_URL, "/providers-public")
 
 # User profile endpoints
 @app.get("/api/v1/user/profile")

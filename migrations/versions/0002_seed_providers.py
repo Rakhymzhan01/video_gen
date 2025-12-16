@@ -40,8 +40,8 @@ def upgrade() -> None:
     op.bulk_insert(providers_table, [
         {
             'id': str(uuid.uuid4()),
-            'name': 'Veo 3',
-            'type': 'VEO3',
+            'name': 'Google Veo 3',
+            'type': 'veo3',
             'supports_image_input': True,
             'max_duration_seconds': 60,
             'max_resolution_width': 1920,
@@ -54,14 +54,14 @@ def upgrade() -> None:
         },
         {
             'id': str(uuid.uuid4()),
-            'name': 'Sora 2',
-            'type': 'SORA2',
+            'name': 'OpenAI Sora',
+            'type': 'sora',
             'supports_image_input': True,
             'max_duration_seconds': 20,
             'max_resolution_width': 1920,
             'max_resolution_height': 1080,
-            'cost_per_second': 0.03,
-            'cost_multiplier_with_image': 1.5,
+            'cost_per_second': 0.05,
+            'cost_multiplier_with_image': 1.8,
             'is_active': True,
             'is_healthy': True,
             'failure_count': 0,
@@ -85,4 +85,4 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     # Remove the seeded providers
-    op.execute("DELETE FROM providers WHERE type IN ('VEO3', 'SORA2', 'KLING')")
+    op.execute("DELETE FROM providers WHERE type IN ('veo3', 'sora', 'kling')")

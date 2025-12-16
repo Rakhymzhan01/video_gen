@@ -7,7 +7,7 @@ services:
     environment:
       POSTGRES_DB: vide_gen
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: password
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     ports:
       - "5432:5432"
     volumes:
@@ -18,6 +18,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
   redis:
     image: redis:7-alpine
@@ -30,6 +31,7 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
+    restart: unless-stopped
 
   mongodb:
     image: mongo:7
@@ -44,6 +46,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
   # Message Queue
   rabbitmq:
@@ -52,8 +55,8 @@ services:
       - "5672:5672"
       - "15672:15672"  # Management UI
     environment:
-      RABBITMQ_DEFAULT_USER: guest
-      RABBITMQ_DEFAULT_PASS: guest
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
@@ -61,6 +64,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
   # Storage (S3-compatible)
   minio:
@@ -69,8 +73,8 @@ services:
       - "9000:9000"
       - "9001:9001"  # Console
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     command: server /data --console-address ":9001"
     volumes:
       - minio_data:/data
@@ -79,6 +83,7 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
+    restart: unless-stopped
 
   # Create MinIO bucket
   minio-init:
@@ -88,9 +93,9 @@ services:
     entrypoint: >
       /bin/sh -c "
       sleep 5;
-      /usr/bin/mc alias set minio http://minio:9000 minioadmin minioadmin;
-      /usr/bin/mc mb minio/vide-gen-local --ignore-existing;
-      /usr/bin/mc policy set public minio/vide-gen-local;
+      /usr/bin/mc alias set minio http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
+      /usr/bin/mc mb minio/vide-gen-production --ignore-existing;
+      /usr/bin/mc policy set public minio/vide-gen-production;
       echo 'MinIO bucket created successfully';
       "
 
@@ -100,19 +105,19 @@ services:
       context: .
       dockerfile: services/api-gateway/Dockerfile
     ports:
-      - "8000:8000"
+      - "80:8000"
     environment:
-      DATABASE_URL: postgresql://postgres:password@postgres:5432/vide_gen
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/vide_gen
       REDIS_URL: redis://redis:6379/0
       MONGODB_URL: mongodb://mongodb:27017/vide_gen
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
       MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
-      MINIO_BUCKET: vide-gen-local
-      JWT_SECRET_KEY: dev-secret-key-change-in-production
-      ENVIRONMENT: development
-      DEBUG: "true"
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: vide-gen-production
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      ENVIRONMENT: production
+      DEBUG: "false"
       LOG_LEVEL: INFO
     volumes:
       - ./services/api-gateway:/app
@@ -133,11 +138,11 @@ services:
       context: .
       dockerfile: services/auth/Dockerfile
     environment:
-      DATABASE_URL: postgresql://postgres:password@postgres:5432/vide_gen
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/vide_gen
       REDIS_URL: redis://redis:6379/1
-      JWT_SECRET_KEY: dev-secret-key-change-in-production
-      ENVIRONMENT: development
-      DEBUG: "true"
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      ENVIRONMENT: production
+      DEBUG: "false"
     volumes:
       - ./services/auth:/app
       - ./shared:/app/shared
@@ -153,13 +158,13 @@ services:
       context: .
       dockerfile: services/image/Dockerfile
     environment:
-      DATABASE_URL: postgresql://postgres:password@postgres:5432/vide_gen
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/vide_gen
       MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
-      MINIO_BUCKET: vide-gen-local
-      ENVIRONMENT: development
-      DEBUG: "true"
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: vide-gen-production
+      ENVIRONMENT: production
+      DEBUG: "false"
     volumes:
       - ./services/image:/app
       - ./shared:/app/shared
@@ -175,14 +180,14 @@ services:
       context: .
       dockerfile: services/video/Dockerfile
     environment:
-      DATABASE_URL: postgresql://postgres:password@postgres:5432/vide_gen
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/vide_gen
       REDIS_URL: redis://redis:6379/2
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-      OPENAI_API_KEY: your_openai_api_key_here
-      GOOGLE_AI_API_KEY: AIzaSyBZeMF5vc1fsMmsQ6_jfFzYvYQkl8A97Xk
-      WAN_API_KEY: your_wan_api_key_here
-      ENVIRONMENT: development
-      DEBUG: "true"
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      GOOGLE_AI_API_KEY: ${GOOGLE_AI_API_KEY}
+      WAN_API_KEY: ${WAN_API_KEY}
+      ENVIRONMENT: production
+      DEBUG: "false"
     volumes:
       - ./services/video:/app
       - ./shared:/app/shared
@@ -200,10 +205,10 @@ services:
       context: .
       dockerfile: services/billing/Dockerfile
     environment:
-      DATABASE_URL: postgresql://postgres:password@postgres:5432/vide_gen
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/vide_gen
       REDIS_URL: redis://redis:6379/3
-      ENVIRONMENT: development
-      DEBUG: "true"
+      ENVIRONMENT: production
+      DEBUG: "false"
     volumes:
       - ./services/billing:/app
       - ./shared:/app/shared
@@ -219,11 +224,11 @@ services:
       context: .
       dockerfile: services/notification/Dockerfile
     environment:
-      DATABASE_URL: postgresql://postgres:password@postgres:5432/vide_gen
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/vide_gen
       MONGODB_URL: mongodb://mongodb:27017/vide_gen
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-      ENVIRONMENT: development
-      DEBUG: "true"
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      ENVIRONMENT: production
+      DEBUG: "false"
     volumes:
       - ./services/notification:/app
       - ./shared:/app/shared
@@ -240,17 +245,17 @@ services:
       context: .
       dockerfile: workers/video-worker/Dockerfile
     environment:
-      DATABASE_URL: postgresql://postgres:password@postgres:5432/vide_gen
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/vide_gen
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
       MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
-      MINIO_BUCKET: vide-gen-local
-      VEO3_API_KEY: mock-veo3-key
-      SORA2_API_KEY: mock-sora2-key
-      KLING_API_KEY: mock-kling-key
-      ENVIRONMENT: development
-      DEBUG: "true"
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: vide-gen-production
+      VEO3_API_KEY: ${VEO3_API_KEY}
+      SORA2_API_KEY: ${SORA2_API_KEY}
+      KLING_API_KEY: ${KLING_API_KEY}
+      ENVIRONMENT: production
+      DEBUG: "false"
     volumes:
       - ./workers/video-worker:/app
       - ./shared:/app/shared
@@ -270,14 +275,14 @@ services:
       context: .
       dockerfile: workers/post-processor/Dockerfile
     environment:
-      DATABASE_URL: postgresql://postgres:password@postgres:5432/vide_gen
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/vide_gen
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
       MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
-      MINIO_BUCKET: vide-gen-local
-      ENVIRONMENT: development
-      DEBUG: "true"
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: vide-gen-production
+      ENVIRONMENT: production
+      DEBUG: "false"
     volumes:
       - ./workers/post-processor:/app
       - ./shared:/app/shared
@@ -290,71 +295,13 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # Monitoring
-  prometheus:
-    image: prom/prometheus:latest
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./infrastructure/prometheus.yml:/etc/prometheus/prometheus.yml
-      - prometheus_data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/etc/prometheus/console_libraries'
-      - '--web.console.templates=/etc/prometheus/consoles'
-
-  grafana:
-    image: grafana/grafana:latest
-    ports:
-      - "3000:3000"
-    environment:
-      GF_SECURITY_ADMIN_PASSWORD: admin
-    volumes:
-      - grafana_data:/var/lib/grafana
-      - ./infrastructure/grafana/dashboards:/etc/grafana/provisioning/dashboards
-      - ./infrastructure/grafana/datasources:/etc/grafana/provisioning/datasources
-
-  # ELK Stack for logging
-  elasticsearch:
-    image: elasticsearch:8.11.0
-    environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
-      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
-    ports:
-      - "9200:9200"
-    volumes:
-      - elasticsearch_data:/usr/share/elasticsearch/data
-
-  kibana:
-    image: kibana:8.11.0
-    ports:
-      - "5601:5601"
-    environment:
-      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
-    depends_on:
-      - elasticsearch
-
-  logstash:
-    image: logstash:8.11.0
-    ports:
-      - "5044:5044"
-    volumes:
-      - ./infrastructure/logstash.conf:/usr/share/logstash/pipeline/logstash.conf
-    depends_on:
-      - elasticsearch
-
 volumes:
   postgres_data:
   redis_data:
   mongo_data:
   rabbitmq_data:
   minio_data:
-  prometheus_data:
-  grafana_data:
-  elasticsearch_data:
 
 networks:
   default:
-    name: vide-gen-network
+    name: vide-gen-production

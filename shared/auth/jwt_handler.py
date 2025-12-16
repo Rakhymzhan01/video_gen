@@ -2,15 +2,21 @@
 JWT token handling utilities.
 """
 import os
+import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Union
 from uuid import UUID
 
 import jwt
-from passlib.context import CryptContext
 
-# Password hashing
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# Simple password hashing using hashlib (for development)
+def simple_hash_password(password: str, salt: str = "dev-salt-123") -> str:
+    """Simple password hashing for development."""
+    return hashlib.sha256((password + salt).encode()).hexdigest()
+
+def simple_verify_password(plain_password: str, hashed_password: str, salt: str = "dev-salt-123") -> bool:
+    """Simple password verification for development."""
+    return hashlib.sha256((plain_password + salt).encode()).hexdigest() == hashed_password
 
 # JWT settings
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "dev-secret-key-change-in-production")
@@ -20,13 +26,13 @@ REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
 
 
 def hash_password(password: str) -> str:
-    """Hash a password using bcrypt."""
-    return pwd_context.hash(password)
+    """Hash a password (simple implementation for development)."""
+    return simple_hash_password(password)
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify a password against its hash."""
-    return pwd_context.verify(plain_password, hashed_password)
+    return simple_verify_password(plain_password, hashed_password)
 
 
 def create_access_token(
