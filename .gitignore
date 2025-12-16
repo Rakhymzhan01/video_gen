@@ -1,0 +1,28 @@
+.env
+  .env.local
+  .env.production
+  .env.development
+
+# Python
+  __pycache__/
+  *.pyc
+  *.pyo
+  *.pyd
+  .Python
+  *.so
+  .pytest_cache/
+
+  # Docker
+  .dockerignore
+
+  # Logs
+  logs/
+  *.log
+
+  # Databases
+  *.db
+  *.sqlite3
+
+  # OS files
+  .DS_Store
+  Thumbs.db
