@@ -105,7 +105,7 @@ services:
       context: .
       dockerfile: services/api-gateway/Dockerfile
     ports:
-      - "8080:8000"
+      - "80:8000"
     environment:
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/vide_gen
       REDIS_URL: redis://redis:6379/0

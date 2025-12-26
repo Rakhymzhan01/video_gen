@@ -68,6 +68,7 @@ sudo ufw default allow outgoing
 sudo ufw allow ssh
 sudo ufw allow 80/tcp   # HTTP
 sudo ufw allow 443/tcp  # HTTPS
+sudo ufw allow 8080/tcp # API Gateway (alternative port)
 sudo ufw allow 15672/tcp # RabbitMQ Management (optional, can be removed for security)
 sudo ufw allow 9001/tcp  # MinIO Console (optional, can be removed for security)
 
