@@ -4,7 +4,7 @@ const multer = require('multer');
 const { GoogleGenAI } = require('@google/genai');
 const { v4: uuidv4 } = require('uuid');
 const redis = require('redis');
-require('dotenv').config();
+require('dotenv').config({ path: '../../.env' });
 
 const app = express();
 const PORT = process.env.PORT || 8006;
