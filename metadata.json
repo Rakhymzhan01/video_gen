@@ -1,0 +1,5 @@
+{
+  "name": "duutz duutz video generator",
+  "description": "An application to generate stunning videos from text prompts and optional images using Google's Veo model.",
+  "requestFramePermissions": []
+}

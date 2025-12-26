@@ -105,7 +105,7 @@ services:
       context: .
       dockerfile: services/api-gateway/Dockerfile
     ports:
-      - "80:8000"
+      - "8080:8000"
     environment:
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/vide_gen
       REDIS_URL: redis://redis:6379/0
@@ -185,6 +185,7 @@ services:
       RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       GOOGLE_AI_API_KEY: ${GOOGLE_AI_API_KEY}
+      VEO3_USE_MOCK: "true"
       WAN_API_KEY: ${WAN_API_KEY}
       ENVIRONMENT: production
       DEBUG: "false"
@@ -252,6 +253,7 @@ services:
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
       MINIO_BUCKET: vide-gen-production
       VEO3_API_KEY: ${VEO3_API_KEY}
+      VEO3_USE_MOCK: "true"
       SORA2_API_KEY: ${SORA2_API_KEY}
       KLING_API_KEY: ${KLING_API_KEY}
       ENVIRONMENT: production

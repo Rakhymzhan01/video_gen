@@ -179,13 +179,8 @@ services:
       REDIS_URL: redis://redis:6379/2
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       OPENAI_API_KEY: your_openai_api_key_here
-      GOOGLE_AI_API_KEY: AIzaSyBZeMF5vc1fsMmsQ6_jfFzYvYQkl8A97Xk
-      WAN_API_KEY: your_wan_api_key_here
-      ENVIRONMENT: development
-      DEBUG: "true"
-    volumes:
-      - ./services/video:/app
-      - ./shared:/app/shared
+      GOOGLE_AI_API_KEY: ${GOOGLE_AI_API_KEY}
+      VEO3_USE_MOCK: "false"
     depends_on:
       postgres:
         condition: service_healthy
@@ -194,6 +189,21 @@ services:
       rabbitmq:
         condition: service_healthy
     restart: unless-stopped
+    networks:
+      - vide-gen-network
+
+  # Node.js Video Service for real VEO API
+  video-service-node:
+    build:
+      context: .
+      dockerfile: services/video-node/Dockerfile
+    environment:
+      GOOGLE_AI_API_KEY: ${GOOGLE_AI_API_KEY}
+      PORT: 8006
+      NODE_ENV: production
+    restart: unless-stopped
+    networks:
+      - vide-gen-network
 
   billing-service:
     build:
@@ -246,7 +256,8 @@ services:
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
       MINIO_BUCKET: vide-gen-local
-      VEO3_API_KEY: mock-veo3-key
+      VEO3_API_KEY: ${GOOGLE_AI_API_KEY}
+      VEO3_USE_MOCK: "false"
       SORA2_API_KEY: mock-sora2-key
       KLING_API_KEY: mock-kling-key
       ENVIRONMENT: development
@@ -356,5 +367,7 @@ volumes:
   elasticsearch_data:
 
 networks:
+  vide-gen-network:
+    driver: bridge
   default:
     name: vide-gen-network

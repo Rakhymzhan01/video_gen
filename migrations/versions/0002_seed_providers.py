@@ -69,7 +69,7 @@ def upgrade() -> None:
         {
             'id': str(uuid.uuid4()),
             'name': 'Kling',
-            'type': 'KLING',
+            'type': 'kling',
             'supports_image_input': True,
             'max_duration_seconds': 30,
             'max_resolution_width': 1920,
@@ -79,10 +79,24 @@ def upgrade() -> None:
             'is_active': True,
             'is_healthy': True,
             'failure_count': 0,
+        },
+        {
+            'id': str(uuid.uuid4()),
+            'name': 'WAN AI',
+            'type': 'wan',
+            'supports_image_input': False,
+            'max_duration_seconds': 30,
+            'max_resolution_width': 1920,
+            'max_resolution_height': 1080,
+            'cost_per_second': 0.01,
+            'cost_multiplier_with_image': 1.0,
+            'is_active': True,
+            'is_healthy': True,
+            'failure_count': 0,
         }
     ])
 
 
 def downgrade() -> None:
     # Remove the seeded providers
-    op.execute("DELETE FROM providers WHERE type IN ('veo3', 'sora', 'kling')")
+    op.execute("DELETE FROM providers WHERE type IN ('veo3', 'sora', 'kling', 'wan')")

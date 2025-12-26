@@ -39,6 +39,7 @@ app.add_middleware(
 AUTH_SERVICE_URL = os.getenv("AUTH_SERVICE_URL", "http://auth-service:8001")
 IMAGE_SERVICE_URL = os.getenv("IMAGE_SERVICE_URL", "http://image-service:8002")
 VIDEO_SERVICE_URL = os.getenv("VIDEO_SERVICE_URL", "http://video-service:8003")
+VIDEO_NODE_SERVICE_URL = os.getenv("VIDEO_NODE_SERVICE_URL", "http://host.docker.internal:8006")
 BILLING_SERVICE_URL = os.getenv("BILLING_SERVICE_URL", "http://billing-service:8004")
 NOTIFICATION_SERVICE_URL = os.getenv("NOTIFICATION_SERVICE_URL", "http://notification-service:8005")
 
@@ -264,7 +265,117 @@ async def view_image_proxy(
     """Proxy public image viewing to image service."""
     return await forward_request(request, IMAGE_SERVICE_URL, f"/view/{image_id}", user)
 
-# Video routes (require authentication)
+# Public video providers endpoint (no auth required) - MUST be before catch-all route
+@app.get("/api/v1/videos/providers-public")
+async def video_providers_public(request: Request):
+    """Get available video providers (no authentication required)."""
+    return await forward_request(request, VIDEO_SERVICE_URL, "/providers-public")
+
+# Public video generation endpoint for testing (no auth required) - MUST be before catch-all route
+@app.post("/api/v1/videos/generate-public")
+async def video_generate_public(request: Request):
+    """Generate video without authentication using real VEO API via Node.js service."""
+    print("🎬 Public video generation endpoint hit - using Node.js VEO service")
+    async with httpx.AsyncClient(timeout=180.0) as client:  # Longer timeout for video generation
+        try:
+            # Get request body from frontend
+            body = await request.json()
+            print(f"📝 Received request body: {body}")
+            
+            # Transform frontend request to Node.js service format
+            node_request = {
+                "prompt": body.get("prompt", "A happy cat playing with a ball of yarn"),
+                "duration": body.get("duration", 5),
+                "resolution": body.get("resolution", "1280x720"),
+                "provider": body.get("provider", "VEO3")
+            }
+            
+            print(f"🚀 Sending to Node.js VEO service: {node_request}")
+            
+            # Forward to Node.js video service for real VEO API
+            response = await client.post(
+                f"{VIDEO_NODE_SERVICE_URL}/generate",
+                json=node_request,
+                timeout=60.0  # Initial request timeout
+            )
+            
+            return JSONResponse(
+                content=response.json() if response.headers.get("content-type", "").startswith("application/json") else {"message": response.text},
+                status_code=response.status_code
+            )
+        except Exception as e:
+            return JSONResponse(
+                content={"error": str(e)},
+                status_code=500
+            )
+
+# Public video status endpoint for testing (no auth required) - MUST be before catch-all route
+@app.get("/api/v1/videos/{video_id}/status-public")
+async def video_status_public(video_id: str):
+    """Get video status without authentication using Redis shared state."""
+    print(f"📊 Public video status check for {video_id} - using Redis shared state")
+    
+    try:
+        import redis
+        # Connect to Redis
+        redis_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"), decode_responses=True)
+        
+        # Get operation status from Redis
+        operation_data = redis_client.get(f"video_op:{video_id}")
+        
+        if not operation_data:
+            return JSONResponse(
+                content={"error": "Operation not found"},
+                status_code=404
+            )
+        
+        import json
+        operation = json.loads(operation_data)
+        
+        # Format response to match expected structure
+        response_data = {
+            "id": video_id,
+            "status": operation.get("status", "processing"),
+            "progress_percentage": operation.get("progress", 0),
+            "video_url": operation.get("video_url"),
+            "error_message": operation.get("error_message"),
+            "metadata": operation.get("metadata", {
+                "provider": "VEO3",
+                "model": "veo-3.1-fast-generate-preview", 
+                "prompt": operation.get("prompt", ""),
+                "real_api": True,
+                "node_service": True,
+                "created_at": operation.get("createdAt"),
+                "completed_at": operation.get("completedAt"),
+                "image_provided": operation.get("imageProvided", False)
+            })
+        }
+        
+        print(f"✅ Retrieved status from Redis: {operation.get('status')}")
+        return JSONResponse(content=response_data, status_code=200)
+        
+    except Exception as e:
+        print(f"❌ Error checking Redis: {str(e)}")
+        # Fallback to Node.js service if Redis fails
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            try:
+                response = await client.get(
+                    f"{VIDEO_NODE_SERVICE_URL}/{video_id}/status",
+                    timeout=30.0
+                )
+                
+                return JSONResponse(
+                    content=response.json() if response.headers.get("content-type", "").startswith("application/json") else {"message": response.text},
+                    status_code=response.status_code
+                )
+            except Exception as fallback_error:
+                print(f"❌ Fallback to Node.js also failed: {str(fallback_error)}")
+                return JSONResponse(
+                    content={"error": str(e)},
+                    status_code=500
+                )
+
+# Video routes (require authentication) - catch-all route must be AFTER specific routes
 @app.api_route("/api/v1/videos/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def videos_proxy(
     request: Request, 
@@ -299,12 +410,6 @@ async def notifications_proxy(
 async def webhooks_proxy(request: Request, path: str):
     """Proxy webhook requests to notification service."""
     return await forward_request(request, NOTIFICATION_SERVICE_URL, f"/webhooks/{path}")
-
-# Public video providers endpoint (no auth required)
-@app.get("/api/v1/videos/providers-public")
-async def video_providers_public(request: Request):
-    """Get available video providers (no authentication required)."""
-    return await forward_request(request, VIDEO_SERVICE_URL, "/providers-public")
 
 # User profile endpoints
 @app.get("/api/v1/user/profile")
