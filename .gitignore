@@ -26,3 +26,12 @@
   # OS files
   .DS_Store
   Thumbs.db
+
+# Local / temp
+*.pyc
+__pycache__/
+*.save
+*.bak.*
+*.log
+*.mp4
+worker.py
