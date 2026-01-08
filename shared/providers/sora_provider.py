@@ -59,9 +59,9 @@ class SoraProvider(BaseVideoProvider):
         except Exception:
             d = 4
 
-        if d <= 4:
+        if d <= 5:
             return "4"
-        if d <= 8:
+        if d <= 10:
             return "8"
         return "12"
 

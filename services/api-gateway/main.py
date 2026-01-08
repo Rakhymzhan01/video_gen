@@ -23,13 +23,24 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
+
+origins = [
+    "https://duutzduutz.com",
+    "https://www.duutzduutz.com",
+]
+
+if os.getenv("ENVIRONMENT") == "development":
+    origins += ["http://localhost:5173", "http://127.0.0.1:5173"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"] if os.getenv("ENVIRONMENT") == "development" else ["https://yourdomain.com"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
 
 AUTH_SERVICE_URL = os.getenv("AUTH_SERVICE_URL", "http://auth-service:8001")
 IMAGE_SERVICE_URL = os.getenv("IMAGE_SERVICE_URL", "http://image-service:8002")
@@ -226,6 +237,9 @@ async def auth_proxy(request: Request, path: str):
         headers.pop("host", None)
         headers.pop("content-length", None)
 
+        headers.pop("authorization", None)
+        headers.pop("Authorization", None)
+
         url = f"{AUTH_SERVICE_URL}/{path}"
         params = dict(request.query_params)
 
@@ -258,6 +272,7 @@ async def auth_proxy(request: Request, path: str):
                     secure=True,
                     samesite="lax",
                     path="/",
+                      domain=".duutzduutz.com",
                 )
         return out
 
@@ -276,13 +291,20 @@ async def view_image_proxy(request: Request, image_id: str, user: Optional[User]
 
 @app.post("/api/v1/videos/generate-public")
 @app.post("/api/v1/videos/generate-public/")
-async def generate_video_public_proxy(request: Request, user: User = Depends(get_current_user)):
+async def generate_video_public_proxy(
+    request: Request,
+    user: Optional[User] = Depends(get_current_user_optional),
+):
     return await forward_request(request, VIDEO_SERVICE_URL, "/generate", user)
 
 
 @app.get("/api/v1/videos/{video_id}/status-public")
 @app.get("/api/v1/videos/{video_id}/status-public/")
-async def video_status_public_proxy(request: Request, video_id: str, user: User = Depends(get_current_user)):
+async def video_status_public_proxy(
+    request: Request,
+    video_id: str,
+    user: Optional[User] = Depends(get_current_user_optional),
+):
     return await forward_request(request, VIDEO_SERVICE_URL, f"/{video_id}/status", user)
 
 
