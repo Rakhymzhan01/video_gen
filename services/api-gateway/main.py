@@ -23,7 +23,6 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
-
 origins = [
     "https://duutzduutz.com",
     "https://www.duutzduutz.com",
@@ -39,8 +38,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
 
 AUTH_SERVICE_URL = os.getenv("AUTH_SERVICE_URL", "http://auth-service:8001")
 IMAGE_SERVICE_URL = os.getenv("IMAGE_SERVICE_URL", "http://image-service:8002")
@@ -272,7 +269,7 @@ async def auth_proxy(request: Request, path: str):
                     secure=True,
                     samesite="lax",
                     path="/",
-                      domain=".duutzduutz.com",
+                    domain=".duutzduutz.com",
                 )
         return out
 
@@ -308,30 +305,23 @@ async def video_status_public_proxy(
     return await forward_request(request, VIDEO_SERVICE_URL, f"/{video_id}/status", user)
 
 
+# ✅ FIX: file endpoint must be PUBLIC-friendly and must NOT depend on /status
+# - user optional
+# - direct stream from video-service /{video_id}/file
 @app.get("/api/v1/videos/{video_id}/file")
 @app.get("/api/v1/videos/{video_id}/file/")
-async def video_file_proxy(request: Request, video_id: str, user: User = Depends(get_current_user)):
-    user_headers = _build_user_headers(user)
+async def video_file_proxy(
+    request: Request,
+    video_id: str,
+    user: Optional[User] = Depends(get_current_user_optional),
+):
+    target_url = f"{VIDEO_SERVICE_URL}/{video_id}/file"
 
-    status_resp = await http_client.get(
-        f"{VIDEO_SERVICE_URL}/{video_id}/status",
-        headers=user_headers,
-    )
-    if status_resp.status_code != 200:
-        payload = status_resp.json() if status_resp.headers.get("content-type", "").startswith("application/json") else {"detail": status_resp.text}
-        return JSONResponse(content=payload, status_code=status_resp.status_code)
+    upstream_headers: Dict[str, str] = {}
+    if user:
+        upstream_headers.update(_build_user_headers(user))
 
-    data = status_resp.json()
-    video_url = data.get("video_url")
-    if not video_url:
-        raise HTTPException(status_code=404, detail="Video URL not available yet")
-
-    if isinstance(video_url, str) and video_url.startswith("/"):
-        target_url = f"{VIDEO_SERVICE_URL}{video_url}"
-        upstream_headers = {**user_headers, **_pass_range_headers(request)}
-    else:
-        target_url = str(video_url)
-        upstream_headers = _pass_range_headers(request)
+    upstream_headers.update(_pass_range_headers(request))
 
     stream_timeout = httpx.Timeout(60.0, read=3600.0)
 
@@ -352,6 +342,7 @@ async def video_file_proxy(request: Request, video_id: str, user: User = Depends
                 "etag",
                 "last-modified",
                 "cache-control",
+                "content-disposition",
             ]:
                 v = upstream.headers.get(h)
                 if v:

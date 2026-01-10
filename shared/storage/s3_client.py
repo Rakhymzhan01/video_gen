@@ -3,7 +3,7 @@ S3-compatible storage client (works with AWS S3 and MinIO).
 """
 import os
 from typing import Optional, BinaryIO
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse
 
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
@@ -17,30 +17,64 @@ class StorageClient:
     """
 
     def __init__(self):
-        minio_endpoint = os.getenv("MINIO_ENDPOINT")
+        # --- Detect MinIO ---
+        minio_endpoint = (os.getenv("MINIO_ENDPOINT") or "").strip()
 
-        if minio_endpoint:
-            self.use_minio = True
-            self.bucket_name = os.getenv("MINIO_BUCKET", "vide-gen-local")
+        # If endpoint isn't provided but MinIO creds exist, assume we're in docker-compose and MinIO service is "minio"
+        minio_access = (os.getenv("MINIO_ACCESS_KEY") or "").strip() or (os.getenv("MINIO_ROOT_USER") or "").strip()
+        minio_secret = (os.getenv("MINIO_SECRET_KEY") or "").strip() or (os.getenv("MINIO_ROOT_PASSWORD") or "").strip()
+
+        if not minio_endpoint and (minio_access and minio_secret):
+            # default internal docker DNS name
+            minio_endpoint = "minio:9000"
+
+        self.use_minio = bool(minio_endpoint)
+
+        if self.use_minio:
+            self.bucket_name = (os.getenv("MINIO_BUCKET") or "vide-gen-local").strip()
+
+            # For MinIO inside docker network -> usually http
+            secure_env = (os.getenv("MINIO_SECURE") or "false").lower().strip()
+            secure = secure_env in ("1", "true", "yes", "on")
+
+            if not minio_access or not minio_secret:
+                raise RuntimeError(
+                    "MinIO credentials not found. Set MINIO_ACCESS_KEY/MINIO_SECRET_KEY "
+                    "or MINIO_ROOT_USER/MINIO_ROOT_PASSWORD"
+                )
+
             self.minio_client = Minio(
                 minio_endpoint,
-                access_key=os.getenv("MINIO_ACCESS_KEY", "minioadmin"),
-                secret_key=os.getenv("MINIO_SECRET_KEY", "minioadmin"),
-                secure=False  # внутри docker / локально
+                access_key=minio_access,
+                secret_key=minio_secret,
+                secure=secure,
             )
+
             self._ensure_bucket_exists()
-        else:
-            self.use_minio = False
-            self.bucket_name = os.getenv("S3_BUCKET", "vide-gen-bucket")
-            try:
-                self.s3_client = boto3.client(
-                    "s3",
-                    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-                    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-                    region_name=os.getenv("AWS_REGION", "us-east-1"),
-                )
-            except NoCredentialsError:
-                raise RuntimeError("AWS credentials not found. Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
+            return
+
+        # --- AWS S3 fallback ---
+        self.bucket_name = (os.getenv("S3_BUCKET") or "vide-gen-bucket").strip()
+
+        aws_access = (os.getenv("AWS_ACCESS_KEY_ID") or "").strip()
+        aws_secret = (os.getenv("AWS_SECRET_ACCESS_KEY") or "").strip()
+        aws_region = (os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-east-1").strip()
+
+        if not aws_access or not aws_secret:
+            raise RuntimeError(
+                "AWS credentials not found AND MINIO_ENDPOINT not set. "
+                "Either set MINIO_ENDPOINT (+ MINIO creds) or set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY."
+            )
+
+        try:
+            self.s3_client = boto3.client(
+                "s3",
+                aws_access_key_id=aws_access,
+                aws_secret_access_key=aws_secret,
+                region_name=aws_region,
+            )
+        except NoCredentialsError:
+            raise RuntimeError("AWS credentials not found. Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
 
     def _ensure_bucket_exists(self):
         if not self.use_minio:
@@ -126,33 +160,29 @@ class StorageClient:
         http://minio:9000/<bucket>/<key>?...  ->  <PUBLIC_BASE>/<bucket>/<key>?...
         Example PUBLIC_BASE: https://duutzduutz.com/minio
         """
-        public_base = os.getenv("MINIO_PUBLIC_BASE_URL", "").strip()
+        public_base = (os.getenv("MINIO_PUBLIC_BASE_URL") or "").strip()
         if not public_base:
             return presigned_url
 
-        # normalize base (remove trailing slash)
         public_base = public_base.rstrip("/")
-
-        # parse original
         p = urlparse(presigned_url)
-        # p.path like: /vide-gen-local/videos/...
-        # keep path + query
         return f"{public_base}{p.path}?{p.query}" if p.query else f"{public_base}{p.path}"
 
     def generate_presigned_url(self, key: str, expiration: int = 3600, method: str = "GET") -> Optional[str]:
         try:
             if self.use_minio:
                 from datetime import timedelta
+
                 expires = timedelta(seconds=expiration)
 
                 if method.upper() == "GET":
                     url = self.minio_client.presigned_get_object(self.bucket_name, key, expires=expires)
                     return self._rewrite_minio_public_url(url)
-                elif method.upper() == "PUT":
+                if method.upper() == "PUT":
                     url = self.minio_client.presigned_put_object(self.bucket_name, key, expires=expires)
                     return self._rewrite_minio_public_url(url)
-                else:
-                    raise ValueError(f"Unsupported method: {method}")
+
+                raise ValueError(f"Unsupported method: {method}")
 
             # AWS S3
             if method.upper() == "GET":
@@ -161,14 +191,14 @@ class StorageClient:
                     Params={"Bucket": self.bucket_name, "Key": key},
                     ExpiresIn=expiration,
                 )
-            elif method.upper() == "PUT":
+            if method.upper() == "PUT":
                 return self.s3_client.generate_presigned_url(
                     "put_object",
                     Params={"Bucket": self.bucket_name, "Key": key},
                     ExpiresIn=expiration,
                 )
-            else:
-                raise ValueError(f"Unsupported method: {method}")
+
+            raise ValueError(f"Unsupported method: {method}")
 
         except (S3Error, ClientError) as e:
             print(f"Error generating presigned URL for {key}: {e}")

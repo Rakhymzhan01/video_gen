@@ -94,6 +94,61 @@ def _normalize_provider_url(url: str) -> str:
     return u
 
 
+def _parse_range_header(range_header: str, total_size: int) -> Optional[tuple[int, int]]:
+    """
+    Parse HTTP Range header: "bytes=start-end"
+    Returns (start, end) inclusive.
+    """
+    if not range_header:
+        return None
+    range_header = range_header.strip().lower()
+    if not range_header.startswith("bytes="):
+        return None
+
+    spec = range_header.replace("bytes=", "", 1).strip()
+    # We only support a single range: "start-end"
+    if "," in spec:
+        spec = spec.split(",", 1)[0].strip()
+
+    if "-" not in spec:
+        return None
+
+    start_s, end_s = spec.split("-", 1)
+    start_s = start_s.strip()
+    end_s = end_s.strip()
+
+    # cases:
+    # 1) "bytes=100-200"
+    # 2) "bytes=100-" (to end)
+    # 3) "bytes=-500" (last 500 bytes)
+    try:
+        if start_s and end_s:
+            start = int(start_s)
+            end = int(end_s)
+        elif start_s and not end_s:
+            start = int(start_s)
+            end = total_size - 1
+        elif not start_s and end_s:
+            # last N bytes
+            n = int(end_s)
+            if n <= 0:
+                return None
+            start = max(total_size - n, 0)
+            end = total_size - 1
+        else:
+            return None
+    except ValueError:
+        return None
+
+    if start < 0:
+        start = 0
+    if end >= total_size:
+        end = total_size - 1
+    if start > end:
+        return None
+    return start, end
+
+
 async def process_video_generation(video_id: str, generation_request: VideoGenerationRequest, image_url: Optional[str] = None):
     db = next(get_db())
     try:
@@ -166,8 +221,9 @@ async def process_video_generation(video_id: str, generation_request: VideoGener
                     video.file_size = len(video_content)
                     video.actual_duration = Decimal(str(generation_request.duration_seconds))
 
-                    # если провайдер вернул URL — сохраним (если есть)
-                    if getattr(status_response, "video_url", None):
+                    # ✅ FIX: для VEO3 НЕ сохраняем provider_video_id (googleapis download URL даёт 403 на фронте)
+                    # Для остальных провайдеров — как раньше.
+                    if getattr(status_response, "video_url", None) and str(generation_request.provider).upper() != "VEO3":
                         video.provider_video_id = _normalize_provider_url(status_response.video_url)
 
                     db.commit()
@@ -288,7 +344,10 @@ async def generate_video(
         raise HTTPException(status_code=500, detail=f"Provider validation failed: {str(e)}")
 
     if user.credits_balance < Decimal(str(credits_cost)):
-        raise HTTPException(status_code=402, detail=f"Insufficient credits. Required: {credits_cost}, Available: {user.credits_balance}")
+        raise HTTPException(
+            status_code=402,
+            detail=f"Insufficient credits. Required: {credits_cost}, Available: {user.credits_balance}"
+        )
 
     user.credits_balance -= Decimal(str(credits_cost))
 
@@ -338,15 +397,22 @@ async def get_video_status(video_id: str, current_request: Request, db: Session 
 
     video_url = None
     if video.status == JobStatus.COMPLETED:
-        # 1) если провайдер дал URL -> отдаём его
-        if getattr(video, "provider_video_id", None):
-            video_url = _normalize_provider_url(video.provider_video_id)
+        provider_type = (video.provider.type.value if video.provider else "unknown")
 
-        # 2) иначе если есть s3_key -> отдаём FILE на ЭТОМ сервисе
-        elif getattr(video, "s3_key", None):
-            # ВАЖНО: НЕ "/api/v1/videos/.../file" (это путь gateway и даёт петлю)
-            # Тут отдаём путь video-service:
-            video_url = f"/{video_id}/file"
+        # ✅ FIX: для VEO3 никогда не отдаём provider_video_id (googleapis URL), всегда отдаём наш /file
+        if provider_type == "VEO3":
+            if getattr(video, "s3_key", None):
+                video_url = f"/{video_id}/file"
+        else:
+            # 1) если провайдер дал URL -> отдаём его
+            if getattr(video, "provider_video_id", None):
+                video_url = _normalize_provider_url(video.provider_video_id)
+
+            # 2) иначе если есть s3_key -> отдаём FILE на ЭТОМ сервисе
+            elif getattr(video, "s3_key", None):
+                # ВАЖНО: НЕ "/api/v1/videos/.../file" (это путь gateway и даёт петлю)
+                # Тут отдаём путь video-service:
+                video_url = f"/{video_id}/file"
 
     return VideoGenerationResponse(
         id=str(video.id),
@@ -360,7 +426,7 @@ async def get_video_status(video_id: str, current_request: Request, db: Session 
             "provider": video.provider.type.value if video.provider else "unknown",
             "resolution": f"{video.resolution_width}x{video.resolution_height}",
             "duration": video.duration_seconds,
-            "created_at": video.created_at.isoformat(),
+            "created_at": video.created_at.isoformat() if video.created_at else None,
             "completed_at": video.completed_at.isoformat() if video.completed_at else None
         }
     )
@@ -369,15 +435,14 @@ async def get_video_status(video_id: str, current_request: Request, db: Session 
 # ✅ FIXED: stream file from MinIO/S3
 # - Если есть X-User-ID -> проверяем владельца (как раньше)
 # - Если X-User-ID НЕТ -> разрешаем публичную отдачу (чтобы <video> работал без Bearer)
+# - Поддержка Range для перемотки/seek в браузере
 @app.get("/{video_id}/file")
 async def stream_video_file(video_id: str, current_request: Request, db: Session = Depends(get_db)):
     user_id = current_request.headers.get("X-User-ID")
 
     if user_id:
-        # приватный режим (через gateway): проверяем владельца
         video = db.query(Video).filter(and_(Video.id == video_id, Video.user_id == user_id)).first()
     else:
-        # публичный режим (браузер <video> без auth): просто по video_id
         video = db.query(Video).filter(Video.id == video_id).first()
 
     if not video:
@@ -390,18 +455,39 @@ async def stream_video_file(video_id: str, current_request: Request, db: Session
     if not data:
         raise HTTPException(status_code=404, detail="Video file not found in storage")
 
+    total = len(data)
+    range_header = current_request.headers.get("range") or current_request.headers.get("Range")
+    byte_range = _parse_range_header(range_header, total) if range_header else None
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": f'inline; filename="{video_id}.mp4"',
+        # public playback ok; gateway может поставить свои заголовки
+        "Cache-Control": "public, max-age=3600",
+    }
+
+    if not byte_range:
+        headers["Content-Length"] = str(total)
+        return StreamingResponse(
+            BytesIO(data),
+            media_type="video/mp4",
+            headers=headers,
+            status_code=200
+        )
+
+    start, end = byte_range
+    chunk = data[start:end + 1]
+    headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+    headers["Content-Length"] = str(len(chunk))
+
     return StreamingResponse(
-        iter([data]),
+        BytesIO(chunk),
         media_type="video/mp4",
-        headers={
-            "Content-Disposition": f'inline; filename="{video_id}.mp4"',
-            # полезно для браузеров
-            "Cache-Control": "private, max-age=0, no-cache",
-        }
+        headers=headers,
+        status_code=206
     )
 
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8003)
-
