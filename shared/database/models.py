@@ -41,10 +41,10 @@ class TransactionType(str, Enum):
 
 
 class ProviderType(str, Enum):
-    VEO3 = "veo3"
-    SORA = "sora"
-    KLING = "kling"
-    WAN = "wan"
+    VEO3 = "VEO3"
+    SORA = "SORA"
+    KLING = "KLING"
+    WAN = "WAN"
 
 
 class User(Base):

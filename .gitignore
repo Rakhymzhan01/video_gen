@@ -35,3 +35,7 @@ __pycache__/
 *.log
 *.mp4
 worker.py
+
+# Python
+__pycache__/
+*.pyc
