@@ -19,14 +19,15 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy shared modules
-COPY shared/ ./shared/
+# Create non-root user (no recursive chown)
+RUN useradd -m -u 1000 appuser
 
-# Copy service code
-COPY services/image/ ./
+# Copy shared modules (set owner during copy)
+COPY --chown=1000:1000 shared/ ./shared/
 
-# Create non-root user
-RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+# Copy service code (set owner during copy)
+COPY --chown=1000:1000 services/image/ ./
+
 USER appuser
 
 # Expose port

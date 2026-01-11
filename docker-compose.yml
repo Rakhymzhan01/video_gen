@@ -16,8 +16,9 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 10s
-      timeout: 5s
+      timeout: 15s
       retries: 5
+      start_period: 30s
 
   redis:
     image: redis:7-alpine
@@ -48,6 +49,7 @@ services:
   # Message Queue
   rabbitmq:
     image: rabbitmq:3-management-alpine
+    user: "999:999"
     ports:
       - "5672:5672"
       - "15672:15672"  # Management UI
@@ -57,10 +59,11 @@ services:
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 10s
-      timeout: 5s
-      retries: 5
+      timeout: 30s
+      retries: 20
+      start_period: 60s
 
   # Storage (S3-compatible)
   minio:
@@ -178,9 +181,22 @@ services:
       DATABASE_URL: postgresql://postgres:password@postgres:5432/vide_gen
       REDIS_URL: redis://redis:6379/2
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-      OPENAI_API_KEY: your_openai_api_key_here
-      GOOGLE_AI_API_KEY: ${GOOGLE_AI_API_KEY}
-      VEO3_USE_MOCK: "false"
+      GOOGLE_AI_API_KEY: AIzaSyBZeMF5vc1fsMmsQ6_jfFzYvYQkl8A97Xk
+      WAN_API_KEY: your_wan_api_key_here
+
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: vide-gen-local     
+
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      SORA_API_KEY: ${SORA_API_KEY}
+
+      ENVIRONMENT: development
+      DEBUG: "true"
+    volumes:
+      - ./services/video:/app
+      - ./shared:/app/shared
     depends_on:
       postgres:
         condition: service_healthy
@@ -189,21 +205,6 @@ services:
       rabbitmq:
         condition: service_healthy
     restart: unless-stopped
-    networks:
-      - vide-gen-network
-
-  # Node.js Video Service for real VEO API
-  video-service-node:
-    build:
-      context: .
-      dockerfile: services/video-node/Dockerfile
-    environment:
-      GOOGLE_AI_API_KEY: ${GOOGLE_AI_API_KEY}
-      PORT: 8006
-      NODE_ENV: production
-    restart: unless-stopped
-    networks:
-      - vide-gen-network
 
   billing-service:
     build:
@@ -256,8 +257,7 @@ services:
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
       MINIO_BUCKET: vide-gen-local
-      VEO3_API_KEY: ${GOOGLE_AI_API_KEY}
-      VEO3_USE_MOCK: "false"
+      VEO3_API_KEY: mock-veo3-key
       SORA2_API_KEY: mock-sora2-key
       KLING_API_KEY: mock-kling-key
       ENVIRONMENT: development
@@ -367,7 +367,5 @@ volumes:
   elasticsearch_data:
 
 networks:
-  vide-gen-network:
-    driver: bridge
   default:
     name: vide-gen-network

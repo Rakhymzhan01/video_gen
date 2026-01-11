@@ -1,256 +1,307 @@
 """
 OpenAI Sora video generation provider implementation.
 """
-import asyncio
-import json
-import uuid
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, Tuple
+
 import httpx
+
 from .base import (
-    BaseVideoProvider, VideoGenerationRequest, VideoGenerationResponse, 
-    VideoStatus, ProviderError, ProviderTimeout, ProviderQuotaExceeded
+    BaseVideoProvider,
+    VideoGenerationRequest,
+    VideoGenerationResponse,
+    VideoStatus,
+    ProviderError,
+    ProviderTimeout,
+    ProviderQuotaExceeded,
 )
 
 
 class SoraProvider(BaseVideoProvider):
     """OpenAI Sora video generation provider."""
-    
+
+    # UI/alias -> API model id
+    MODEL_MAP = {
+        "sora-2": "sora-2",
+        "SORA2": "sora-2",
+        "Sora 2": "sora-2",
+        "Sora 2 Turbo": "sora-2",
+        "Sora 1.0 Turbo": "sora-2",  # часто UI так пишет — на API мапим в sora-2
+        "sora2": "sora-2",
+    }
+
+    # что НЕ разрешаем перезаписывать из provider_specific_params
+    RESERVED_KEYS = {"model", "prompt", "size", "seconds", "image_url"}
+
+    # реальные размеры (по ошибке от API)
+    # ВАЖНО: у тебя в одной ошибке было 4 размера, в другой — только 2.
+    # Мы оставляем 4, а нормализацию делаем в 2 "безопасных" (720x1280 / 1280x720).
+    ALLOWED_SIZES = ("720x1280", "1280x720", "1024x1792", "1792x1024")
+    SAFE_SIZES = ("720x1280", "1280x720")
+
     def __init__(self, api_key: str, api_url: str = "https://api.openai.com/v1"):
         super().__init__(api_key, api_url)
         self.name = "sora"
+        # IMPORTANT: do NOT set Content-Type globally
         self.client = httpx.AsyncClient(
             timeout=60.0,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json"
-            }
+            headers={"Authorization": f"Bearer {self.api_key}"},
         )
+
+    def _normalize_model(self, model_value: Optional[str]) -> str:
+        if not model_value:
+            return "sora-2"
+        m = str(model_value).strip()
+        return self.MODEL_MAP.get(m, "sora-2")
+
+    def _normalize_seconds(self, duration_seconds: Any) -> str:
+        try:
+            d = int(round(float(duration_seconds)))
+        except Exception:
+            d = 4
+
+        if d <= 5:
+            return "4"
+        if d <= 10:
+            return "8"
+        return "12"
+
+    def _normalize_size(self, w: Any, h: Any) -> str:
+        """
+        Sora-2 у тебя реально принимает только фиксированные size.
+        Мы маппим любое входное разрешение в одно из SAFE_SIZES:
+        - landscape -> 1280x720
+        - portrait  -> 720x1280
+        """
+        try:
+            ww = int(w)
+            hh = int(h)
+        except Exception:
+            ww, hh = 1280, 720
+
+        # защита от деления на 0
+        if hh <= 0 or ww <= 0:
+            return "1280x720"
+
+        if ww >= hh:
+            return "1280x720"
+        return "720x1280"
 
     async def generate_video(self, request: VideoGenerationRequest) -> VideoGenerationResponse:
         """Start video generation with Sora."""
-        
-        # Validate request first
         self.validate_request(request)
-        
-        # Prepare request payload
-        payload = {
-            "model": "sora-1.0-turbo",
+
+        # normalize model from UI/provider params
+        model_ui = (request.provider_specific_params or {}).get("model")
+        model = self._normalize_model(model_ui)
+
+        # normalize size for API
+        normalized_size = self._normalize_size(request.resolution_width, request.resolution_height)
+
+        # what we send
+        req_payload: Dict[str, Any] = {
+            "model": model,
             "prompt": request.prompt,
-            "size": f"{request.resolution_width}x{request.resolution_height}",
-            "duration": request.duration_seconds,
+            "size": normalized_size,
+            "seconds": self._normalize_seconds(request.duration_seconds),
         }
-        
-        # Add image input if provided
+
         if request.image_url:
-            payload["image"] = request.image_url
-        
-        # Add provider-specific parameters
+            req_payload["image_url"] = request.image_url
+
+        # allow extra provider params BUT don't override reserved keys
         if request.provider_specific_params:
-            payload.update(request.provider_specific_params)
-        
+            for k, v in request.provider_specific_params.items():
+                if k in self.RESERVED_KEYS:
+                    continue
+                req_payload[k] = v
+
         try:
-            response = await self.client.post(
-                f"{self.api_url}/video/generations",
-                json=payload
-            )
-            
+            response = await self.client.post(f"{self.api_url}/videos", json=req_payload)
+
             if response.status_code == 429:
-                raise ProviderQuotaExceeded(
-                    "Rate limit or quota exceeded",
-                    self.name,
-                    "quota_exceeded"
-                )
-            
+                raise ProviderQuotaExceeded("Rate limit or quota exceeded", self.name, "quota_exceeded")
+
             response.raise_for_status()
-            data = response.json()
-            
-            # Generate internal ID for tracking
-            generation_id = str(uuid.uuid4())
-            
+            resp_payload = response.json()
+
+            sora_id = resp_payload.get("id")
+            if not sora_id:
+                raise ProviderError("Sora response missing id", self.name, "bad_response")
+
+            status_raw = (resp_payload.get("status") or "").lower()
+            status = VideoStatus.COMPLETED if status_raw == "completed" else VideoStatus.PROCESSING
+
+            # progress sometimes absent
+            progress_val = resp_payload.get("progress")
+            try:
+                progress = int(progress_val) if progress_val is not None else 0
+            except Exception:
+                progress = 0
+
             return VideoGenerationResponse(
-                generation_id=generation_id,
-                status=VideoStatus.PROCESSING,
-                estimated_completion_time=request.duration_seconds * 30,  # Rough estimate
-                progress_percentage=0,
+                generation_id=sora_id,
+                status=status,
+                estimated_completion_time=int(request.duration_seconds) * 30,
+                progress_percentage=progress,
                 metadata={
-                    "sora_job_id": data.get("id"),
+                    "sora_job_id": sora_id,
                     "provider": "sora",
-                    "model": "sora-1.0-turbo"
-                }
+                    "model": resp_payload.get("model") or req_payload["model"],
+                    # важно: возвращаем тот size, который реально отправили
+                    "size": resp_payload.get("size") or req_payload["size"],
+                    "seconds": resp_payload.get("seconds") or req_payload["seconds"],
+                    "raw_status": resp_payload.get("status"),
+                },
             )
-            
+
         except httpx.TimeoutException:
-            raise ProviderTimeout(
-                "Request timed out",
-                self.name,
-                "timeout"
-            )
+            raise ProviderTimeout("Request timed out", self.name, "timeout")
+
         except httpx.HTTPStatusError as e:
-            error_msg = "Unknown error"
-            if e.response.status_code == 400:
-                error_data = e.response.json() if e.response.text else {}
-                error_msg = error_data.get("error", {}).get("message", "Invalid request")
-            elif e.response.status_code == 401:
-                error_msg = "Invalid API key"
+            status_code = str(e.response.status_code)
+            msg = "Unknown error"
+
+            # Try to parse OpenAI-style error json
+            try:
+                raw = e.response.json()
+                msg = raw.get("error", {}).get("message") or raw.get("message") or msg
+            except Exception:
+                try:
+                    msg = (e.response.text or msg).strip()
+                except Exception:
+                    pass
+
+            if e.response.status_code == 401:
+                msg = "Invalid API key (401)"
             elif e.response.status_code == 403:
-                error_msg = "Access denied"
+                msg = "Access denied / forbidden (403)"
+            elif e.response.status_code == 404:
+                msg = "Sora endpoint not found (404) — check API URL/path"
             elif e.response.status_code >= 500:
-                error_msg = "Sora service temporarily unavailable"
-            
-            raise ProviderError(
-                error_msg,
-                self.name,
-                str(e.response.status_code)
-            )
+                msg = "Sora service temporarily unavailable (5xx)"
+
+            raise ProviderError(msg, self.name, status_code)
+
+        except Exception as e:
+            raise ProviderError(f"Unexpected error: {str(e)}", self.name, "unexpected")
 
     async def get_status(self, generation_id: str) -> VideoGenerationResponse:
         """Get status of video generation."""
-        
-        # In a real implementation, you would track the mapping between 
-        # generation_id and sora_job_id, but for this example we'll simulate
         try:
-            # This is a mock implementation - in reality you'd call:
-            # response = await self.client.get(f"{self.api_url}/video/generations/{sora_job_id}")
-            
-            # For demo purposes, simulate different statuses
-            import random
-            
-            # Simulate processing with random progress
-            if random.random() < 0.8:  # 80% chance still processing
-                return VideoGenerationResponse(
-                    generation_id=generation_id,
-                    status=VideoStatus.PROCESSING,
-                    progress_percentage=min(90, random.randint(10, 80)),
-                    metadata={"provider": "sora"}
-                )
-            else:  # 20% chance completed
+            response = await self.client.get(f"{self.api_url}/videos/{generation_id}")
+            response.raise_for_status()
+            payload = response.json()
+
+            status_raw = (payload.get("status") or "queued").lower()
+            progress_val = payload.get("progress")
+            try:
+                progress = int(progress_val) if progress_val is not None else 0
+            except Exception:
+                progress = 0
+
+            if status_raw == "completed":
                 return VideoGenerationResponse(
                     generation_id=generation_id,
                     status=VideoStatus.COMPLETED,
                     progress_percentage=100,
-                    video_url=f"https://sora-videos.openai.com/video_{generation_id}.mp4",
-                    metadata={"provider": "sora"}
+                    metadata={"provider": "sora", "raw_status": status_raw},
                 )
-                
-        except Exception as e:
+
+            if status_raw in ("failed", "canceled", "cancelled"):
+                err = payload.get("error") or {}
+                msg = err.get("message") if isinstance(err, dict) else str(err)
+                return VideoGenerationResponse(
+                    generation_id=generation_id,
+                    status=VideoStatus.FAILED,
+                    progress_percentage=progress,
+                    error_message=msg or "Video generation failed",
+                    metadata={"provider": "sora", "raw_status": status_raw},
+                )
+
             return VideoGenerationResponse(
                 generation_id=generation_id,
-                status=VideoStatus.FAILED,
-                error_message=str(e),
-                metadata={"provider": "sora"}
+                status=VideoStatus.PROCESSING,
+                progress_percentage=progress,
+                metadata={"provider": "sora", "raw_status": status_raw},
             )
+
+        except httpx.TimeoutException:
+            raise ProviderTimeout("Status request timed out", self.name, "timeout")
+        except Exception as e:
+            raise ProviderError(f"Failed to get status: {str(e)}", self.name, "status_failed")
 
     async def download_video(self, generation_id: str) -> Optional[bytes]:
         """Download the generated video."""
-        
         status_response = await self.get_status(generation_id)
-        
-        if status_response.status != VideoStatus.COMPLETED or not status_response.video_url:
+        if status_response.status != VideoStatus.COMPLETED:
             return None
-        
+
         try:
-            response = await self.client.get(status_response.video_url)
-            response.raise_for_status()
-            return response.content
-            
+            r = await self.client.get(f"{self.api_url}/videos/{generation_id}/content")
+            r.raise_for_status()
+            return r.content
         except Exception as e:
-            raise ProviderError(
-                f"Failed to download video: {str(e)}",
-                self.name,
-                "download_failed"
-            )
+            raise ProviderError(f"Failed to download video: {str(e)}", self.name, "download_failed")
 
     async def cancel_generation(self, generation_id: str) -> bool:
         """Cancel video generation."""
         try:
-            # In a real implementation, you would call:
-            # response = await self.client.delete(f"{self.api_url}/video/generations/{sora_job_id}")
-            
-            # For demo purposes, always return True
+            # if you have a real cancel endpoint, implement it here
             return True
-            
         except Exception:
             return False
 
     def validate_request(self, request: VideoGenerationRequest) -> bool:
         """Validate request parameters for Sora."""
-        
         capabilities = self.get_capabilities()
-        
-        # Check duration
+
         if request.duration_seconds > capabilities["max_duration_seconds"]:
             raise ValueError(
-                f"Duration {request.duration_seconds}s exceeds maximum "
-                f"{capabilities['max_duration_seconds']}s for Sora"
+                f"Duration {request.duration_seconds}s exceeds maximum {capabilities['max_duration_seconds']}s for Sora"
             )
-        
         if request.duration_seconds <= 0:
             raise ValueError("Duration must be positive")
-        
-        # Check resolution
-        max_width = capabilities["max_resolution"][0]
-        max_height = capabilities["max_resolution"][1]
-        
-        if request.resolution_width > max_width or request.resolution_height > max_height:
-            raise ValueError(
-                f"Resolution {request.resolution_width}x{request.resolution_height} "
-                f"exceeds maximum {max_width}x{max_height} for Sora"
-            )
-        
-        # Check aspect ratio (Sora supports specific ratios)
-        supported_ratios = ["1920x1080", "1080x1920", "1216x832", "832x1216", "1344x768", "768x1344"]
-        current_ratio = f"{request.resolution_width}x{request.resolution_height}"
-        
-        if current_ratio not in supported_ratios:
-            # Check if it's a close match to a supported ratio
-            aspect_ratio = request.resolution_width / request.resolution_height
-            
-            # Allow 16:9, 9:16, and some other common ratios
-            valid_aspects = [16/9, 9/16, 4/3, 3/4, 1.75, 1/1.75]
-            if not any(abs(aspect_ratio - valid) < 0.1 for valid in valid_aspects):
-                raise ValueError(
-                    f"Aspect ratio not supported by Sora. "
-                    f"Supported resolutions: {', '.join(supported_ratios)}"
-                )
-        
-        # Check prompt
-        if not request.prompt or len(request.prompt.strip()) == 0:
+
+        # не валим по 1920x1080, потому что мы всё равно нормализуем size в generate_video()
+        # но проверим аспект, чтобы совсем мусор не прилетал
+        if request.resolution_width <= 0 or request.resolution_height <= 0:
+            raise ValueError("Resolution must be positive")
+
+        aspect_ratio = request.resolution_width / request.resolution_height
+        valid_aspects = [16 / 9, 9 / 16]
+        if not any(abs(aspect_ratio - v) < 0.15 for v in valid_aspects):
+            # допускаем небольшой люфт
+            raise ValueError("Aspect ratio not supported by Sora (expected ~16:9 or ~9:16)")
+
+        if not request.prompt or not request.prompt.strip():
             raise ValueError("Prompt cannot be empty")
-        
         if len(request.prompt) > 1000:
             raise ValueError("Prompt too long (max 1000 characters)")
-        
+
         return True
 
     def get_capabilities(self) -> Dict[str, Any]:
-        """Get Sora provider capabilities."""
         return {
-            "max_duration_seconds": 20,  # Sora supports up to 20 seconds
-            "max_resolution": (1920, 1080),  # Full HD max
-            "supports_image_input": True,  # Sora supports image-to-video
+            "max_duration_seconds": 20,
+            "max_resolution": (1792, 1792),
+            "supports_image_input": True,
             "supported_formats": ["mp4"],
-            "cost_per_second": 0.05,  # Higher cost for Sora
+            "cost_per_second": 0.05,
             "image_cost_multiplier": 1.8,
             "supported_resolutions": [
-                "1920x1080", "1080x1920",  # 16:9 and 9:16
-                "1216x832", "832x1216",    # 3:2 and 2:3  
-                "1344x768", "768x1344"     # 7:4 and 4:7
+                "720x1280",
+                "1280x720",
+                "1024x1792",
+                "1792x1024",
             ],
-            "model_versions": ["sora-1.0-turbo"],
-            "features": [
-                "text-to-video",
-                "image-to-video", 
-                "high_quality_output",
-                "realistic_physics",
-                "temporal_consistency"
-            ]
+            "model_versions": ["sora-2"],
+            "features": ["text-to-video", "image-to-video"],
         }
 
     async def health_check(self) -> bool:
-        """Check if Sora API is healthy."""
         try:
-            response = await self.client.get(f"{self.api_url}/models")
-            return response.status_code == 200
+            r = await self.client.get(f"{self.api_url}/models")
+            return r.status_code == 200
         except Exception:
             return False
 

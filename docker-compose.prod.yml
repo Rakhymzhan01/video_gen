@@ -1,7 +1,6 @@
-version: '3.8'
+version: "3.9"
 
 services:
-  # Databases
   postgres:
     image: postgres:15-alpine
     environment:
@@ -14,10 +13,10 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d vide_gen"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
     restart: unless-stopped
 
   redis:
@@ -30,7 +29,7 @@ services:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 3s
-      retries: 5
+      retries: 10
     restart: unless-stopped
 
   mongodb:
@@ -45,15 +44,14 @@ services:
       test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
     restart: unless-stopped
 
-  # Message Queue
   rabbitmq:
     image: rabbitmq:3-management-alpine
     ports:
       - "5672:5672"
-      - "15672:15672"  # Management UI
+      - "15672:15672"
     environment:
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
@@ -62,16 +60,16 @@ services:
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "ping"]
       interval: 10s
-      timeout: 5s
-      retries: 5
+      timeout: 30s
+      retries: 12
+      start_period: 60s
     restart: unless-stopped
 
-  # Storage (S3-compatible)
   minio:
     image: minio/minio:latest
     ports:
       - "9000:9000"
-      - "9001:9001"  # Console
+      - "9001:9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
@@ -82,30 +80,30 @@ services:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 10s
       timeout: 3s
-      retries: 5
+      retries: 10
     restart: unless-stopped
 
-  # Create MinIO bucket
   minio-init:
     image: minio/mc:latest
     depends_on:
-      - minio
+      minio:
+        condition: service_healthy
     entrypoint: >
       /bin/sh -c "
-      sleep 5;
-      /usr/bin/mc alias set minio http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
-      /usr/bin/mc mb minio/vide-gen-production --ignore-existing;
-      /usr/bin/mc policy set public minio/vide-gen-production;
-      echo 'MinIO bucket created successfully';
+      mc alias set minio http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
+      mc mb minio/vide-gen-production --ignore-existing;
+      mc anonymous set download minio/vide-gen-production || true;
+      echo 'MinIO bucket ready';
       "
+    restart: on-failure
 
-  # Core Services
   api-gateway:
     build:
       context: .
       dockerfile: services/api-gateway/Dockerfile
     ports:
-      - "80:8000"
+      - "8000:8000"
+    env_file: .env
     environment:
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/vide_gen
       REDIS_URL: redis://redis:6379/0
@@ -115,13 +113,10 @@ services:
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
       MINIO_BUCKET: vide-gen-production
+      MINIO_PUBLIC_BASE_URL: ${MINIO_PUBLIC_BASE_URL}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY}
       ENVIRONMENT: production
       DEBUG: "false"
-      LOG_LEVEL: INFO
-    volumes:
-      - ./services/api-gateway:/app
-      - ./shared:/app/shared
     depends_on:
       postgres:
         condition: service_healthy
@@ -137,15 +132,12 @@ services:
     build:
       context: .
       dockerfile: services/auth/Dockerfile
+    env_file: .env
     environment:
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/vide_gen
       REDIS_URL: redis://redis:6379/1
       JWT_SECRET_KEY: ${JWT_SECRET_KEY}
       ENVIRONMENT: production
-      DEBUG: "false"
-    volumes:
-      - ./services/auth:/app
-      - ./shared:/app/shared
     depends_on:
       postgres:
         condition: service_healthy
@@ -157,17 +149,13 @@ services:
     build:
       context: .
       dockerfile: services/image/Dockerfile
+    env_file: .env
     environment:
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/vide_gen
       MINIO_ENDPOINT: minio:9000
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
       MINIO_BUCKET: vide-gen-production
-      ENVIRONMENT: production
-      DEBUG: "false"
-    volumes:
-      - ./services/image:/app
-      - ./shared:/app/shared
     depends_on:
       postgres:
         condition: service_healthy
@@ -179,19 +167,12 @@ services:
     build:
       context: .
       dockerfile: services/video/Dockerfile
+    env_file: .env
     environment:
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/vide_gen
       REDIS_URL: redis://redis:6379/2
       RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
       GOOGLE_AI_API_KEY: ${GOOGLE_AI_API_KEY}
-      VEO3_USE_MOCK: "true"
-      WAN_API_KEY: ${WAN_API_KEY}
-      ENVIRONMENT: production
-      DEBUG: "false"
-    volumes:
-      - ./services/video:/app
-      - ./shared:/app/shared
     depends_on:
       postgres:
         condition: service_healthy
@@ -201,99 +182,26 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  billing-service:
-    build:
-      context: .
-      dockerfile: services/billing/Dockerfile
-    environment:
-      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/vide_gen
-      REDIS_URL: redis://redis:6379/3
-      ENVIRONMENT: production
-      DEBUG: "false"
-    volumes:
-      - ./services/billing:/app
-      - ./shared:/app/shared
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    restart: unless-stopped
-
-  notification-service:
-    build:
-      context: .
-      dockerfile: services/notification/Dockerfile
-    environment:
-      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/vide_gen
-      MONGODB_URL: mongodb://mongodb:27017/vide_gen
-      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
-      ENVIRONMENT: production
-      DEBUG: "false"
-    volumes:
-      - ./services/notification:/app
-      - ./shared:/app/shared
-    depends_on:
-      mongodb:
-        condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
-    restart: unless-stopped
-
-  # Workers
   video-worker:
     build:
       context: .
       dockerfile: workers/video-worker/Dockerfile
+    env_file: .env
     environment:
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/vide_gen
       RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
-      MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
-      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
-      MINIO_BUCKET: vide-gen-production
       VEO3_API_KEY: ${VEO3_API_KEY}
-      VEO3_USE_MOCK: "true"
-      SORA2_API_KEY: ${SORA2_API_KEY}
-      KLING_API_KEY: ${KLING_API_KEY}
-      ENVIRONMENT: production
-      DEBUG: "false"
-    volumes:
-      - ./workers/video-worker:/app
-      - ./shared:/app/shared
-    depends_on:
-      postgres:
-        condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
-    restart: unless-stopped
-    deploy:
-      replicas: 2
-
-  post-processor:
-    build:
-      context: .
-      dockerfile: workers/post-processor/Dockerfile
-    environment:
-      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/vide_gen
-      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+   
       MINIO_ENDPOINT: minio:9000
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
       MINIO_BUCKET: vide-gen-production
-      ENVIRONMENT: production
-      DEBUG: "false"
-    volumes:
-      - ./workers/post-processor:/app
-      - ./shared:/app/shared
+      MINIO_PUBLIC_BASE_URL: ${MINIO_PUBLIC_BASE_URL}
+
     depends_on:
       postgres:
         condition: service_healthy
       rabbitmq:
-        condition: service_healthy
-      minio:
         condition: service_healthy
     restart: unless-stopped
 

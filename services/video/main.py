@@ -1,90 +1,48 @@
 """
 Video Service - Handles video generation requests using multiple providers including Sora.
 """
-import os
 import uuid
 import asyncio
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 from decimal import Decimal
+from io import BytesIO
 
 from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
 
 from shared.database.connection import get_db, create_tables
-from shared.database.models import Video, Provider, User, Image, ProviderType, JobStatus
-# Note: Auth is handled by API Gateway, not directly in video service
+from shared.database.models import Video, Provider, User, Image, JobStatus
 from shared.providers import (
-    create_provider, get_available_providers, VideoGenerationRequest as ProviderRequest, VideoStatus, 
+    create_provider, get_available_providers,
+    VideoGenerationRequest as ProviderRequest,
+    VideoStatus,
     ProviderError, ProviderTimeout, ProviderQuotaExceeded
 )
-# S3 storage disabled for now
+from shared.storage.s3_client import storage_client  # ✅ add
 
-# Mock provider for development when API keys are not available
-class MockProvider:
-    def __init__(self, provider_type):
-        self.name = provider_type
-        self.provider_type = provider_type
-    
-    def validate_request(self, request):
-        print(f"Mock validation for {self.provider_type}: OK")
-        return True
-    
-    def calculate_cost(self, request):
-        return request.duration_seconds * 0.01  # Mock cost
-    
-    async def generate_video(self, request):
-        import uuid
-        from shared.providers import VideoGenerationResponse, VideoStatus
-        print(f"Mock video generation for {self.provider_type}")
-        return VideoGenerationResponse(
-            generation_id=str(uuid.uuid4()),
-            status=VideoStatus.PROCESSING,
-            progress_percentage=0,
-            metadata={"provider": self.provider_type, "mock": True}
-        )
-    
-    async def get_status(self, generation_id):
-        from shared.providers import VideoGenerationResponse, VideoStatus
-        print(f"Mock status check for {generation_id}")
-        # Use a real playable sample video for testing
-        sample_video_url = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
-        return VideoGenerationResponse(
-            generation_id=generation_id,
-            status=VideoStatus.COMPLETED,
-            progress_percentage=100,
-            video_url=sample_video_url,
-            metadata={"provider": self.provider_type, "mock": True, "note": "Sample video for testing"}
-        )
-    
-    async def download_video(self, generation_id):
-        print(f"Mock video download for {generation_id}")
-        return b"mock video content"  # Mock video bytes
-
-# Initialize FastAPI app
 app = FastAPI(
     title="Video Generation Service",
     description="AI-powered video generation with multiple provider support",
     version="1.0.0"
 )
 
-# S3 storage disabled
-
-# Provider instances cache
 provider_instances: Dict[str, Any] = {}
+
 
 class VideoGenerationRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=1000, description="Text prompt for video generation")
     duration_seconds: int = Field(default=5, ge=1, le=20, description="Video duration in seconds")
     resolution_width: int = Field(default=1920, ge=256, le=1920, description="Video width in pixels")
-    resolution_height: int = Field(default=1080, ge=256, le=1080, description="Video height in pixels")
+    resolution_height: int = Field(default=1080, ge=256, le=1920, description="Video height in pixels")
     fps: int = Field(default=24, ge=12, le=60, description="Frames per second")
     provider: str = Field(default="sora", description="Video generation provider")
     image_id: Optional[str] = Field(None, description="Optional image ID for image-to-video generation")
     provider_specific_params: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Provider-specific parameters")
+
 
 class VideoGenerationResponse(BaseModel):
     id: str
@@ -97,46 +55,109 @@ class VideoGenerationResponse(BaseModel):
     credits_cost: float
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
+
 class VideoListResponse(BaseModel):
     videos: List[VideoGenerationResponse]
     total: int
     page: int
     page_size: int
 
+
 def get_provider_instance(provider_type: str, api_key: str = None) -> Any:
-    """Get or create provider instance using factory pattern."""
-    
+    key = f"{provider_type}:{api_key or ''}"
+    if key in provider_instances:
+        return provider_instances[key]
     try:
-        return create_provider(provider_type, api_key)
+        inst = create_provider(provider_type, api_key)
+        provider_instances[key] = inst
+        return inst
     except ValueError as e:
-        print(f"Provider validation error: {e}")
         raise HTTPException(status_code=400, detail=f"Provider error: {str(e)}")
     except RuntimeError as e:
-        print(f"Provider runtime error: {e}")
-        # For development, use mock provider if API key is missing or model not available
-        if "API key not configured" in str(e) or provider_type in ["VEO3", "veo3"]:
-            print(f"Using mock provider for {provider_type} (Veo models not available with current API key)")
-            return MockProvider(provider_type)
         raise HTTPException(status_code=500, detail=f"Provider setup failed: {str(e)}")
 
-async def process_video_generation(
-    video_id: str, 
-    generation_request: VideoGenerationRequest,
-    image_url: Optional[str] = None
-):
-    """Background task to process video generation."""
-    
+
+def _normalize_provider_url(url: str) -> str:
+    """
+    Some providers may return:
+    - absolute url: https://...
+    - protocol-relative: //...
+    - relative path: /files/...
+    For absolute and protocol-relative we keep it,
+    for relative we keep it as-is (gateway will redirect to it if needed).
+    """
+    if not url:
+        return url
+    u = str(url).strip()
+    if u.startswith("//"):
+        return "https:" + u
+    return u
+
+
+def _parse_range_header(range_header: str, total_size: int) -> Optional[tuple[int, int]]:
+    """
+    Parse HTTP Range header: "bytes=start-end"
+    Returns (start, end) inclusive.
+    """
+    if not range_header:
+        return None
+    range_header = range_header.strip().lower()
+    if not range_header.startswith("bytes="):
+        return None
+
+    spec = range_header.replace("bytes=", "", 1).strip()
+    # We only support a single range: "start-end"
+    if "," in spec:
+        spec = spec.split(",", 1)[0].strip()
+
+    if "-" not in spec:
+        return None
+
+    start_s, end_s = spec.split("-", 1)
+    start_s = start_s.strip()
+    end_s = end_s.strip()
+
+    # cases:
+    # 1) "bytes=100-200"
+    # 2) "bytes=100-" (to end)
+    # 3) "bytes=-500" (last 500 bytes)
+    try:
+        if start_s and end_s:
+            start = int(start_s)
+            end = int(end_s)
+        elif start_s and not end_s:
+            start = int(start_s)
+            end = total_size - 1
+        elif not start_s and end_s:
+            # last N bytes
+            n = int(end_s)
+            if n <= 0:
+                return None
+            start = max(total_size - n, 0)
+            end = total_size - 1
+        else:
+            return None
+    except ValueError:
+        return None
+
+    if start < 0:
+        start = 0
+    if end >= total_size:
+        end = total_size - 1
+    if start > end:
+        return None
+    return start, end
+
+
+async def process_video_generation(video_id: str, generation_request: VideoGenerationRequest, image_url: Optional[str] = None):
     db = next(get_db())
     try:
-        # Get video record
         video = db.query(Video).filter(Video.id == video_id).first()
         if not video:
             return
-        
-        # Get provider instance
+
         provider = get_provider_instance(generation_request.provider)
-        
-        # Create provider request
+
         provider_request = ProviderRequest(
             prompt=generation_request.prompt,
             duration_seconds=generation_request.duration_seconds,
@@ -146,112 +167,117 @@ async def process_video_generation(
             image_url=image_url,
             provider_specific_params=generation_request.provider_specific_params
         )
-        
-        # Start generation
+
         video.status = JobStatus.PROCESSING
         video.started_at = datetime.utcnow()
         db.commit()
-        
+
         try:
             response = await provider.generate_video(provider_request)
-            
-            # Update video with provider job ID
-            video.provider_job_id = response.metadata.get("sora_job_id")
+
+            # id джобы провайдера
+            video.provider_job_id = response.metadata.get("sora_job_id") or response.generation_id
             db.commit()
-            
-            # Poll for completion
-            max_attempts = 120  # 10 minutes with 5-second intervals
-            attempt = 0
-            
-            while attempt < max_attempts:
+
+            max_attempts = 120  # 120 * 5s = 10 min
+            for _ in range(max_attempts):
                 await asyncio.sleep(5)
-                attempt += 1
-                
+
                 status_response = await provider.get_status(response.generation_id)
-                
-                # Update progress
+
                 video.progress_percentage = status_response.progress_percentage
                 db.commit()
-                
+
                 if status_response.status == VideoStatus.COMPLETED:
-                    # Download video
+                    # скачиваем байты видео от провайдера
                     video_content = await provider.download_video(response.generation_id)
-                    
-                    if video_content:
-                        # For now, just mark as completed without file storage
-                        video.status = JobStatus.COMPLETED
-                        video.completed_at = datetime.utcnow()
-                        video.file_size = len(video_content)
-                        video.actual_duration = Decimal(str(generation_request.duration_seconds))
-                        
-                        # TODO: Implement file storage when needed
-                        print(f"Video generated successfully: {len(video_content)} bytes")
-                        
-                        db.commit()
-                        break
-                    else:
+
+                    if not video_content:
                         video.status = JobStatus.FAILED
                         video.error_message = "Failed to download generated video"
                         db.commit()
-                        break
-                        
-                elif status_response.status == VideoStatus.FAILED:
+                        return
+
+                    # ✅ upload to MinIO/S3
+                    s3_key = f"videos/{video.user_id}/{video.id}/generated.mp4"
+                    ok = storage_client.upload_file(
+                        file_data=BytesIO(video_content),
+                        key=s3_key,
+                        content_type="video/mp4",
+                        metadata={
+                            "video_id": str(video.id),
+                            "provider": str(generation_request.provider),
+                        }
+                    )
+                    if not ok:
+                        video.status = JobStatus.FAILED
+                        video.error_message = "Failed to upload generated video to storage"
+                        db.commit()
+                        return
+
+                    video.s3_key = s3_key
+                    video.status = JobStatus.COMPLETED
+                    video.completed_at = datetime.utcnow()
+                    video.file_size = len(video_content)
+                    video.actual_duration = Decimal(str(generation_request.duration_seconds))
+
+                    # ✅ FIX: для VEO3 НЕ сохраняем provider_video_id (googleapis download URL даёт 403 на фронте)
+                    # Для остальных провайдеров — как раньше.
+                    if getattr(status_response, "video_url", None) and str(generation_request.provider).upper() != "VEO3":
+                        video.provider_video_id = _normalize_provider_url(status_response.video_url)
+
+                    db.commit()
+                    return
+
+                if status_response.status == VideoStatus.FAILED:
                     video.status = JobStatus.FAILED
                     video.error_message = status_response.error_message or "Video generation failed"
                     db.commit()
-                    break
-            
-            else:
-                # Timeout
-                video.status = JobStatus.FAILED
-                video.error_message = "Video generation timed out"
-                db.commit()
-                
+                    return
+
+            video.status = JobStatus.FAILED
+            video.error_message = "Video generation timed out"
+            db.commit()
+
         except (ProviderError, ProviderTimeout, ProviderQuotaExceeded) as e:
             video.status = JobStatus.FAILED
             video.error_message = str(e)
             db.commit()
-            
+
     except Exception as e:
-        # Update video with error
         video = db.query(Video).filter(Video.id == video_id).first()
         if video:
             video.status = JobStatus.FAILED
             video.error_message = f"Internal error: {str(e)}"
             db.commit()
-    
     finally:
         db.close()
 
-# Startup event
+
 @app.on_event("startup")
 async def startup_event():
-    """Initialize database and providers on startup."""
     create_tables()
+
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
     providers_info = get_available_providers()
-    
     return {
         "status": "healthy",
         "service": "video-service",
-        "providers": {
-            name: info["available"] 
-            for name, info in providers_info.items()
-        }
+        "providers": {name: info["available"] for name, info in providers_info.items()}
     }
+
 
 @app.get("/providers")
 async def list_providers():
-    """Get list of available providers and their capabilities."""
     return get_available_providers()
 
-@app.get("/providers-public")  
+
+@app.get("/providers-public")
 async def list_providers_public():
-    """Public endpoint to get list of available providers (no auth required)."""
     return get_available_providers()
+
 
 @app.post("/generate", response_model=VideoGenerationResponse)
 async def generate_video(
@@ -260,115 +286,44 @@ async def generate_video(
     current_request: Request,
     db: Session = Depends(get_db)
 ):
-    """Generate a video using the specified provider."""
-    
-    # Get user from headers (set by API gateway)
     user_id = current_request.headers.get("X-User-ID")
-    user_email = current_request.headers.get("X-User-Email")
-    user_tier = current_request.headers.get("X-User-Tier", "free")
-    
-    # For public testing, use real VEO API without database operations
     if not user_id:
-        import uuid
-        print(f"Public testing mode - using real VEO API without database")
-        
-        try:
-            # Get provider instance
-            provider = get_provider_instance(request.provider)
-            
-            # Create provider request
-            provider_request = ProviderRequest(
-                prompt=request.prompt,
-                duration_seconds=request.duration_seconds,
-                resolution_width=request.resolution_width,
-                resolution_height=request.resolution_height,
-                fps=request.fps,
-                image_url=None,
-                provider_specific_params=request.provider_specific_params
-            )
-            
-            # Start generation using real API
-            print(f"Starting real video generation with {request.provider}")
-            response = await provider.generate_video(provider_request)
-            
-            # Generate a video ID for tracking
-            video_id = str(uuid.uuid4())
-            
-            # Store the operation details for status checking
-            # For simplicity, we'll use a simple in-memory store
-            if not hasattr(generate_video, '_public_operations'):
-                generate_video._public_operations = {}
-            
-            generate_video._public_operations[video_id] = {
-                'provider': provider,
-                'generation_id': response.generation_id,
-                'status': response.status,
-                'provider_name': request.provider
-            }
-            
-            return VideoGenerationResponse(
-                id=video_id,
-                status=response.status.value,
-                progress_percentage=response.progress_percentage,
-                estimated_completion_time=response.estimated_completion_time,
-                credits_cost=0.15,  # Mock cost for public testing
-                video_url=response.video_url if response.status == VideoStatus.COMPLETED else None,
-                metadata={
-                    "provider": request.provider,
-                    "resolution": f"{request.resolution_width}x{request.resolution_height}",
-                    "duration": request.duration_seconds,
-                    "real_api": True,
-                    "generation_id": response.generation_id
-                }
-            )
-            
-        except Exception as e:
-            print(f"Public testing API error: {str(e)}")
-            # Fall back to mock response if real API fails
-            mock_video_id = str(uuid.uuid4())
-            return VideoGenerationResponse(
-                id=mock_video_id,
-                status=JobStatus.FAILED.value,
-                progress_percentage=0,
-                error_message=f"API Error: {str(e)}",
-                credits_cost=0.15,
-                metadata={
-                    "provider": request.provider,
-                    "resolution": f"{request.resolution_width}x{request.resolution_height}",
-                    "duration": request.duration_seconds,
-                    "error": True,
-                    "fallback": "mock"
-                }
-            )
-    
+        raise HTTPException(status_code=401, detail="Authentication required")
+
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
-    
-    # Get or validate provider
+
+    provider_map = {
+        "SORA2": "SORA",
+        "SORA": "SORA",
+        "sora": "SORA",
+        "VEO3": "VEO3",
+        "veo3": "VEO3",
+        "WAN": "WAN",
+        "wan": "WAN",
+        "KLING": "KLING",
+        "kling": "KLING",
+    }
+    request.provider = provider_map.get(request.provider, request.provider)
+
     provider_record = db.query(Provider).filter(
         Provider.type == request.provider,
         Provider.is_active == True
     ).first()
-    
     if not provider_record:
         raise HTTPException(status_code=400, detail=f"Provider {request.provider} not available")
-    
-    # Get provider instance to validate request and calculate cost
+
+    image_url = None
+    if request.image_id:
+        image = db.query(Image).filter(and_(Image.id == request.image_id, Image.user_id == user_id)).first()
+        if not image:
+            raise HTTPException(status_code=404, detail="Image not found")
+        image_url = None  # TODO: when S3 exists
+
     try:
         provider = get_provider_instance(request.provider)
-        
-        # Create provider request for validation
-        image_url = None
-        if request.image_id:
-            image = db.query(Image).filter(
-                and_(Image.id == request.image_id, Image.user_id == user_id)
-            ).first()
-            if not image:
-                raise HTTPException(status_code=404, detail="Image not found")
-            # For now, skip image URL since S3 is not configured
-            image_url = None  # TODO: Implement when S3 is setup
-        
+
         provider_request = ProviderRequest(
             prompt=request.prompt,
             duration_seconds=request.duration_seconds,
@@ -378,29 +333,24 @@ async def generate_video(
             image_url=image_url,
             provider_specific_params=request.provider_specific_params
         )
-        
-        # Validate request
+
         provider.validate_request(provider_request)
-        
-        # Calculate cost
         credits_cost = provider.calculate_cost(provider_request)
-        
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Provider validation failed: {str(e)}")
-    
-    # Check user credits
+
     if user.credits_balance < Decimal(str(credits_cost)):
         raise HTTPException(
-            status_code=402, 
+            status_code=402,
             detail=f"Insufficient credits. Required: {credits_cost}, Available: {user.credits_balance}"
         )
-    
-    # Deduct credits
+
     user.credits_balance -= Decimal(str(credits_cost))
-    
-    # Create video record
+
     video_id = str(uuid.uuid4())
     video = Video(
         id=video_id,
@@ -415,24 +365,18 @@ async def generate_video(
         status=JobStatus.PENDING,
         credits_cost=Decimal(str(credits_cost))
     )
-    
+
     db.add(video)
     db.commit()
-    
-    # Start background processing
-    background_tasks.add_task(
-        process_video_generation, 
-        video_id, 
-        request, 
-        image_url
-    )
-    
+
+    background_tasks.add_task(process_video_generation, video_id, request, image_url)
+
     return VideoGenerationResponse(
         id=video_id,
         status=JobStatus.PENDING.value,
         progress_percentage=0,
         estimated_completion_time=request.duration_seconds * 30,
-        credits_cost=credits_cost,
+        credits_cost=float(credits_cost),
         metadata={
             "provider": request.provider,
             "resolution": f"{request.resolution_width}x{request.resolution_height}",
@@ -440,209 +384,109 @@ async def generate_video(
         }
     )
 
+
 @app.get("/{video_id}/status", response_model=VideoGenerationResponse)
-async def get_video_status(
-    video_id: str,
-    current_request: Request,
-    db: Session = Depends(get_db)
-):
-    """Get status of video generation."""
-    
-    # Get user from headers
+async def get_video_status(video_id: str, current_request: Request, db: Session = Depends(get_db)):
     user_id = current_request.headers.get("X-User-ID")
     if not user_id:
-        # For public testing, check real API status
-        print(f"Public testing mode - checking real API status for {video_id}")
-        
-        # Check if we have the operation stored
-        if hasattr(generate_video, '_public_operations') and video_id in generate_video._public_operations:
-            try:
-                operation = generate_video._public_operations[video_id]
-                provider = operation['provider']
-                generation_id = operation['generation_id']
-                
-                # Check real status from provider
-                print(f"Checking status with provider {operation['provider_name']} for generation {generation_id}")
-                status_response = await provider.get_status(generation_id)
-                
-                # Update stored status
-                generate_video._public_operations[video_id]['status'] = status_response.status
-                
-                return VideoGenerationResponse(
-                    id=video_id,
-                    status=status_response.status.value,
-                    progress_percentage=status_response.progress_percentage,
-                    video_url=status_response.video_url,
-                    error_message=status_response.error_message,
-                    credits_cost=0.15,
-                    metadata={
-                        "provider": operation['provider_name'],
-                        "real_api": True,
-                        "generation_id": generation_id,
-                        **status_response.metadata
-                    }
-                )
-                
-            except Exception as e:
-                print(f"Error checking real status: {str(e)}")
-                return VideoGenerationResponse(
-                    id=video_id,
-                    status=JobStatus.FAILED.value,
-                    progress_percentage=0,
-                    error_message=f"Status check failed: {str(e)}",
-                    credits_cost=0.15,
-                    metadata={
-                        "provider": "VEO3",
-                        "real_api": True,
-                        "error": str(e)
-                    }
-                )
-        else:
-            # Operation not found, might be completed or expired
-            print(f"Operation {video_id} not found in memory, returning sample video")
-            sample_video_url = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
-            return VideoGenerationResponse(
-                id=video_id,
-                status=JobStatus.COMPLETED.value,
-                progress_percentage=100,
-                video_url=sample_video_url,
-                credits_cost=0.15,
-                metadata={
-                    "provider": "VEO3",
-                    "real_api": False,
-                    "fallback": "sample_video",
-                    "note": "Operation not found, returning sample video"
-                }
-            )
-    
-    # Get video from database for authenticated users
-    video = db.query(Video).filter(
-        and_(Video.id == video_id, Video.user_id == user_id)
-    ).first()
-    
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    video = db.query(Video).filter(and_(Video.id == video_id, Video.user_id == user_id)).first()
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
-    
-    # For now, return sample video URL since S3 is not configured
+
     video_url = None
-    thumbnail_url = None
-    
     if video.status == JobStatus.COMPLETED:
-        # Use a real playable sample video for testing
-        video_url = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
-    
+        provider_type = (video.provider.type.value if video.provider else "unknown")
+
+        # ✅ FIX: для VEO3 никогда не отдаём provider_video_id (googleapis URL), всегда отдаём наш /file
+        if provider_type == "VEO3":
+            if getattr(video, "s3_key", None):
+                video_url = f"/{video_id}/file"
+        else:
+            # 1) если провайдер дал URL -> отдаём его
+            if getattr(video, "provider_video_id", None):
+                video_url = _normalize_provider_url(video.provider_video_id)
+
+            # 2) иначе если есть s3_key -> отдаём FILE на ЭТОМ сервисе
+            elif getattr(video, "s3_key", None):
+                # ВАЖНО: НЕ "/api/v1/videos/.../file" (это путь gateway и даёт петлю)
+                # Тут отдаём путь video-service:
+                video_url = f"/{video_id}/file"
+
     return VideoGenerationResponse(
         id=str(video.id),
         status=video.status.value,
         progress_percentage=video.progress_percentage,
         error_message=video.error_message,
         video_url=video_url,
-        thumbnail_url=thumbnail_url,
+        thumbnail_url=None,
         credits_cost=float(video.credits_cost),
         metadata={
             "provider": video.provider.type.value if video.provider else "unknown",
             "resolution": f"{video.resolution_width}x{video.resolution_height}",
             "duration": video.duration_seconds,
-            "created_at": video.created_at.isoformat(),
+            "created_at": video.created_at.isoformat() if video.created_at else None,
             "completed_at": video.completed_at.isoformat() if video.completed_at else None
         }
     )
 
-@app.get("/", response_model=VideoListResponse)
-async def list_user_videos(
-    page: int = 1,
-    page_size: int = 20,
-    status: Optional[str] = None,
-    current_request: Request = None,
-    db: Session = Depends(get_db)
-):
-    """List user's videos with pagination."""
-    
-    # Get user from headers
-    user_id = current_request.headers.get("X-User-ID")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    
-    # Build query
-    query = db.query(Video).filter(Video.user_id == user_id)
-    
-    if status:
-        try:
-            status_enum = JobStatus(status)
-            query = query.filter(Video.status == status_enum)
-        except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid status: {status}")
-    
-    # Get total count
-    total = query.count()
-    
-    # Apply pagination
-    offset = (page - 1) * page_size
-    videos = query.order_by(Video.created_at.desc()).offset(offset).limit(page_size).all()
-    
-    # Convert to response format
-    video_responses = []
-    for video in videos:
-        video_url = None
-        thumbnail_url = None
-        
-        if video.status == JobStatus.COMPLETED:
-            # Use a real playable sample video for testing
-            video_url = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
-        
-        video_responses.append(VideoGenerationResponse(
-            id=str(video.id),
-            status=video.status.value,
-            progress_percentage=video.progress_percentage,
-            error_message=video.error_message,
-            video_url=video_url,
-            thumbnail_url=thumbnail_url,
-            credits_cost=float(video.credits_cost),
-            metadata={
-                "provider": video.provider.type.value if video.provider else "unknown",
-                "resolution": f"{video.resolution_width}x{video.resolution_height}",
-                "duration": video.duration_seconds,
-                "created_at": video.created_at.isoformat(),
-                "completed_at": video.completed_at.isoformat() if video.completed_at else None
-            }
-        ))
-    
-    return VideoListResponse(
-        videos=video_responses,
-        total=total,
-        page=page,
-        page_size=page_size
-    )
 
-@app.delete("/{video_id}")
-async def delete_video(
-    video_id: str,
-    current_request: Request,
-    db: Session = Depends(get_db)
-):
-    """Delete a video and its associated files."""
-    
-    # Get user from headers
+# ✅ FIXED: stream file from MinIO/S3
+# - Если есть X-User-ID -> проверяем владельца (как раньше)
+# - Если X-User-ID НЕТ -> разрешаем публичную отдачу (чтобы <video> работал без Bearer)
+# - Поддержка Range для перемотки/seek в браузере
+@app.get("/{video_id}/file")
+async def stream_video_file(video_id: str, current_request: Request, db: Session = Depends(get_db)):
     user_id = current_request.headers.get("X-User-ID")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    
-    # Get video
-    video = db.query(Video).filter(
-        and_(Video.id == video_id, Video.user_id == user_id)
-    ).first()
-    
+
+    if user_id:
+        video = db.query(Video).filter(and_(Video.id == video_id, Video.user_id == user_id)).first()
+    else:
+        video = db.query(Video).filter(Video.id == video_id).first()
+
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
-    
-    # S3 file deletion disabled since S3 is not configured
-    print(f"Video {video_id} deletion requested (S3 disabled)")
-    
-    # Delete from database
-    db.delete(video)
-    db.commit()
-    
-    return {"message": "Video deleted successfully"}
+
+    if video.status != JobStatus.COMPLETED or not video.s3_key:
+        raise HTTPException(status_code=404, detail="Video file not available yet")
+
+    data = storage_client.download_file(video.s3_key)
+    if not data:
+        raise HTTPException(status_code=404, detail="Video file not found in storage")
+
+    total = len(data)
+    range_header = current_request.headers.get("range") or current_request.headers.get("Range")
+    byte_range = _parse_range_header(range_header, total) if range_header else None
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": f'inline; filename="{video_id}.mp4"',
+        # public playback ok; gateway может поставить свои заголовки
+        "Cache-Control": "public, max-age=3600",
+    }
+
+    if not byte_range:
+        headers["Content-Length"] = str(total)
+        return StreamingResponse(
+            BytesIO(data),
+            media_type="video/mp4",
+            headers=headers,
+            status_code=200
+        )
+
+    start, end = byte_range
+    chunk = data[start:end + 1]
+    headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+    headers["Content-Length"] = str(len(chunk))
+
+    return StreamingResponse(
+        BytesIO(chunk),
+        media_type="video/mp4",
+        headers=headers,
+        status_code=206
+    )
+
 
 if __name__ == "__main__":
     import uvicorn
