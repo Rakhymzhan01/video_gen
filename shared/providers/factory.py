@@ -6,7 +6,9 @@ from typing import Dict, Type
 from .base import BaseVideoProvider
 from .sora_provider import SoraProvider
 from .veo3_provider import Veo3Provider
-from .wan_provider import WANProvider
+from .kling_provider import KlingProvider
+from .seedance_provider import SeedDanceProvider
+from .wan_provider import WanProvider
 
 
 class ProviderFactory:
@@ -16,10 +18,14 @@ class ProviderFactory:
     _providers: Dict[str, Type[BaseVideoProvider]] = {
         "sora": SoraProvider,
         "veo3": Veo3Provider,
-        "wan": WANProvider,
+        "kling": KlingProvider,
+        "seedance": SeedDanceProvider,
+        "wan_fal": WanProvider,  # fal.ai wan provider
         "SORA2": SoraProvider,  # Database enum mapping
         "VEO3": Veo3Provider,   # Database enum mapping
-        "WAN": WANProvider,     # Database enum mapping
+        "KLING": KlingProvider,  # Database enum mapping
+        "SEEDANCE": SeedDanceProvider,  # Database enum mapping
+        "WAN_FAL": WanProvider,  # Database enum mapping
     }
     
     @classmethod
@@ -103,10 +109,14 @@ class ProviderFactory:
         env_var_map = {
             "sora": "OPENAI_API_KEY",
             "veo3": "GOOGLE_AI_API_KEY",
-            "wan": "WAN_API_KEY",
+            "kling": "FAL_KEY",
+            "seedance": "FAL_KEY",
+            "wan_fal": "FAL_KEY",
             "SORA2": "OPENAI_API_KEY",
             "VEO3": "GOOGLE_AI_API_KEY",
-            "WAN": "WAN_API_KEY",
+            "KLING": "FAL_KEY",
+            "SEEDANCE": "FAL_KEY",
+            "WAN_FAL": "FAL_KEY",
         }
         
         env_var = env_var_map.get(provider_type)
@@ -121,10 +131,14 @@ class ProviderFactory:
         url_map = {
             "sora": "https://api.openai.com/v1",
             "veo3": "https://generativelanguage.googleapis.com/v1beta",
-            "wan": "https://api.wan.ai/v1",
+            "kling": "https://queue.fal.run",
+            "seedance": "https://queue.fal.run",
+            "wan_fal": "https://queue.fal.run",
             "SORA2": "https://api.openai.com/v1",
             "VEO3": "https://generativelanguage.googleapis.com/v1beta",
-            "WAN": "https://api.wan.ai/v1",
+            "KLING": "https://queue.fal.run",
+            "SEEDANCE": "https://queue.fal.run",
+            "WAN_FAL": "https://queue.fal.run",
         }
         
         return url_map.get(provider_type, "")

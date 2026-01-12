@@ -11,11 +11,19 @@ from fastapi import FastAPI, HTTPException, Depends, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from typing import Optional
 from sqlalchemy.orm import Session
 
 from shared.database.connection import get_db, create_tables
 from shared.database.models import User
 from shared.auth.dependencies import get_current_user, get_current_user_optional
+
+# Pydantic models for request/response
+class FalVideoGenerationRequest(BaseModel):
+    prompt: str
+    duration: int = 5
+    resolution: str = "1280x720"
+    provider: str = "kling"
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -270,6 +278,95 @@ async def view_image_proxy(
 async def video_providers_public(request: Request):
     """Get available video providers (no authentication required)."""
     return await forward_request(request, VIDEO_SERVICE_URL, "/providers-public")
+
+# Public fal.ai providers endpoint for testing (no auth required)
+@app.post("/api/v1/videos/generate-fal-public")
+async def video_generate_fal_public(request_data: FalVideoGenerationRequest):
+    """Generate video without authentication using fal.ai providers (Kling, SeedDance, Wan)."""
+    print("🎬 Public fal.ai video generation endpoint hit")
+    
+    try:
+        print(f"📝 Received request: {request_data}")
+        
+        # Import our providers
+        import sys
+        import os
+        sys.path.append('.')
+        sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
+        
+        try:
+            from shared.providers.factory import ProviderFactory
+            from shared.providers.base import VideoGenerationRequest
+        except ImportError as import_error:
+            return JSONResponse(
+                content={"error": f"Provider import failed: {import_error}. Make sure fal-client is installed: pip install fal-client"},
+                status_code=500
+            )
+        
+        # Extract parameters
+        prompt = request_data.prompt
+        duration = request_data.duration
+        resolution = request_data.resolution
+        provider_name = request_data.provider.lower()
+        
+        # Parse resolution
+        if "x" in resolution:
+            width, height = map(int, resolution.split("x"))
+        else:
+            width, height = 1280, 720
+        
+        # Map provider names to our factory names
+        provider_map = {
+            "kling": "kling",
+            "seedance": "seedance", 
+            "wan": "wan_fal"
+        }
+        
+        factory_provider_name = provider_map.get(provider_name, "kling")
+        
+        print(f"🚀 Using provider: {factory_provider_name}")
+        print(f"📝 Prompt: {prompt}")
+        print(f"⏱️  Duration: {duration}s")
+        print(f"📐 Resolution: {width}x{height}")
+        
+        # Create provider
+        provider = ProviderFactory.create_provider(factory_provider_name)
+        
+        # Create request
+        video_request = VideoGenerationRequest(
+            prompt=prompt,
+            duration_seconds=duration,
+            resolution_width=width,
+            resolution_height=height,
+            fps=24
+        )
+        
+        # Generate video
+        response = await provider.generate_video(video_request)
+        
+        return JSONResponse(
+            content={
+                "id": response.generation_id,
+                "status": response.status.value,
+                "provider": factory_provider_name,
+                "prompt": prompt,
+                "duration": duration,
+                "resolution": f"{width}x{height}",
+                "estimated_completion_time": response.estimated_completion_time,
+                "progress_percentage": response.progress_percentage,
+                "metadata": response.metadata
+            },
+            status_code=200
+        )
+        
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(
+            content={"error": str(e), "type": str(type(e))},
+            status_code=500
+        )
 
 # Public video generation endpoint for testing (no auth required) - MUST be before catch-all route
 @app.post("/api/v1/videos/generate-public")
