@@ -20,8 +20,8 @@ COPY shared/ ./shared/
 COPY services/notification/ ./
 
 # Create non-root user
-RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
-USER appuser
+#RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+#USER appuser
 
 # Expose port
 EXPOSE 8005

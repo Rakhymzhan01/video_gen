@@ -149,6 +149,74 @@ def _parse_range_header(range_header: str, total_size: int) -> Optional[tuple[in
     return start, end
 
 
+def _provider_map(provider: str) -> str:
+    provider_map = {
+        "SORA2": "SORA",
+        "SORA": "SORA",
+        "sora": "SORA",
+        "VEO3": "VEO3",
+        "veo3": "VEO3",
+        "WAN": "WAN",
+        "wan": "WAN",
+        "KLING": "KLING",
+        "kling": "KLING",
+    }
+    return provider_map.get(provider, provider)
+
+
+def _ensure_user_or_401(current_request: Request, db: Session) -> User:
+    """
+    Strict auth: must have X-User-ID and user must exist.
+    """
+    user_id = current_request.headers.get("X-User-ID")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    if not user.is_active:
+        raise HTTPException(status_code=401, detail="User is inactive")
+    return user
+
+
+def _get_or_create_public_user(db: Session) -> User:
+    """
+    PUBLIC MODE:
+    We use one technical user to own public generated videos.
+    This avoids breaking DB constraints (credits/user_id required).
+    """
+    public_email = "public@duutzduutz.com"
+    user = db.query(User).filter(User.email == public_email).first()
+    if user:
+        return user
+
+    # Create a minimal "public" user
+    user = User(
+        email=public_email,
+        is_active=True,
+        is_verified=True,
+        credits_balance=Decimal("0"),
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def _provider_type_str(video: Video) -> str:
+    """
+    Safely get provider type as string.
+    video.provider.type may be Enum or plain string.
+    """
+    if not video.provider:
+        return "unknown"
+    t = getattr(video.provider, "type", None)
+    if t is None:
+        return "unknown"
+    return t.value if hasattr(t, "value") else str(t)
+
+
 async def process_video_generation(video_id: str, generation_request: VideoGenerationRequest, image_url: Optional[str] = None):
     db = next(get_db())
     try:
@@ -279,6 +347,9 @@ async def list_providers_public():
     return get_available_providers()
 
 
+# =========================
+# PRIVATE: requires auth
+# =========================
 @app.post("/generate", response_model=VideoGenerationResponse)
 async def generate_video(
     request: VideoGenerationRequest,
@@ -286,26 +357,10 @@ async def generate_video(
     current_request: Request,
     db: Session = Depends(get_db)
 ):
-    user_id = current_request.headers.get("X-User-ID")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Authentication required")
+    user = _ensure_user_or_401(current_request, db)
+    user_id = str(user.id)
 
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found")
-
-    provider_map = {
-        "SORA2": "SORA",
-        "SORA": "SORA",
-        "sora": "SORA",
-        "VEO3": "VEO3",
-        "veo3": "VEO3",
-        "WAN": "WAN",
-        "wan": "WAN",
-        "KLING": "KLING",
-        "kling": "KLING",
-    }
-    request.provider = provider_map.get(request.provider, request.provider)
+    request.provider = _provider_map(request.provider)
 
     provider_record = db.query(Provider).filter(
         Provider.type == request.provider,
@@ -387,43 +442,39 @@ async def generate_video(
 
 @app.get("/{video_id}/status", response_model=VideoGenerationResponse)
 async def get_video_status(video_id: str, current_request: Request, db: Session = Depends(get_db)):
-    user_id = current_request.headers.get("X-User-ID")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Authentication required")
+    user = _ensure_user_or_401(current_request, db)
+    user_id = str(user.id)
 
     video = db.query(Video).filter(and_(Video.id == video_id, Video.user_id == user_id)).first()
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
 
+    provider_type = _provider_type_str(video)
+
     video_url = None
     if video.status == JobStatus.COMPLETED:
-        provider_type = (video.provider.type.value if video.provider else "unknown")
-
         # ✅ FIX: для VEO3 никогда не отдаём provider_video_id (googleapis URL), всегда отдаём наш /file
         if provider_type == "VEO3":
             if getattr(video, "s3_key", None):
                 video_url = f"/{video_id}/file"
         else:
-            # 1) если провайдер дал URL -> отдаём его
             if getattr(video, "provider_video_id", None):
                 video_url = _normalize_provider_url(video.provider_video_id)
-
-            # 2) иначе если есть s3_key -> отдаём FILE на ЭТОМ сервисе
             elif getattr(video, "s3_key", None):
-                # ВАЖНО: НЕ "/api/v1/videos/.../file" (это путь gateway и даёт петлю)
-                # Тут отдаём путь video-service:
                 video_url = f"/{video_id}/file"
+
+    status_value = video.status.value if hasattr(video.status, "value") else str(video.status)
 
     return VideoGenerationResponse(
         id=str(video.id),
-        status=video.status.value,
+        status=status_value,
         progress_percentage=video.progress_percentage,
         error_message=video.error_message,
         video_url=video_url,
         thumbnail_url=None,
         credits_cost=float(video.credits_cost),
         metadata={
-            "provider": video.provider.type.value if video.provider else "unknown",
+            "provider": provider_type,
             "resolution": f"{video.resolution_width}x{video.resolution_height}",
             "duration": video.duration_seconds,
             "created_at": video.created_at.isoformat() if video.created_at else None,
@@ -432,10 +483,147 @@ async def get_video_status(video_id: str, current_request: Request, db: Session 
     )
 
 
+# =========================
+# PUBLIC: no auth
+# =========================
+@app.post("/generate-public", response_model=VideoGenerationResponse)
+async def generate_video_public(
+    request: VideoGenerationRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+    """
+    Public generation: no JWT required.
+    We create/use a technical 'public' user to own videos.
+    Credits are NOT charged here (credits_cost = 0).
+    You can later add rate-limit / captcha etc.
+    """
+    public_user = _get_or_create_public_user(db)
+    user_id = str(public_user.id)
+
+    request.provider = _provider_map(request.provider)
+
+    provider_record = db.query(Provider).filter(
+        Provider.type == request.provider,
+        Provider.is_active == True
+    ).first()
+    if not provider_record:
+        raise HTTPException(status_code=400, detail=f"Provider {request.provider} not available")
+
+    # Public: no image ownership checks (or you can forbid image_id)
+    image_url = None
+    if request.image_id:
+        # Safer: forbid for public (uncomment if needed)
+        # raise HTTPException(status_code=400, detail="image_id is not allowed for public generation")
+        image = db.query(Image).filter(Image.id == request.image_id).first()
+        if not image:
+            raise HTTPException(status_code=404, detail="Image not found")
+        image_url = None  # TODO: when S3 exists
+
+    try:
+        provider = get_provider_instance(request.provider)
+
+        provider_request = ProviderRequest(
+            prompt=request.prompt,
+            duration_seconds=request.duration_seconds,
+            resolution_width=request.resolution_width,
+            resolution_height=request.resolution_height,
+            fps=request.fps,
+            image_url=image_url,
+            provider_specific_params=request.provider_specific_params
+        )
+        provider.validate_request(provider_request)
+        # Public: do not charge credits
+        credits_cost = 0.0
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Provider validation failed: {str(e)}")
+
+    video_id = str(uuid.uuid4())
+    video = Video(
+        id=video_id,
+        user_id=user_id,
+        image_id=request.image_id,
+        provider_id=provider_record.id,
+        prompt=request.prompt,
+        duration_seconds=request.duration_seconds,
+        resolution_width=request.resolution_width,
+        resolution_height=request.resolution_height,
+        fps=request.fps,
+        status=JobStatus.PENDING,
+        credits_cost=Decimal(str(credits_cost))
+    )
+
+    db.add(video)
+    db.commit()
+
+    background_tasks.add_task(process_video_generation, video_id, request, image_url)
+
+    return VideoGenerationResponse(
+        id=video_id,
+        status=JobStatus.PENDING.value,
+        progress_percentage=0,
+        estimated_completion_time=request.duration_seconds * 30,
+        credits_cost=float(credits_cost),
+        metadata={
+            "provider": request.provider,
+            "resolution": f"{request.resolution_width}x{request.resolution_height}",
+            "duration": request.duration_seconds,
+            "public": True
+        }
+    )
+
+
+@app.get("/{video_id}/status-public", response_model=VideoGenerationResponse)
+async def get_video_status_public(video_id: str, db: Session = Depends(get_db)):
+    """
+    Public status: does NOT require auth.
+    """
+    video = db.query(Video).filter(Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    provider_type = _provider_type_str(video)
+
+    video_url = None
+    if video.status == JobStatus.COMPLETED:
+        if provider_type == "VEO3":
+            if getattr(video, "s3_key", None):
+                video_url = f"/{video_id}/file"
+        else:
+            if getattr(video, "provider_video_id", None):
+                video_url = _normalize_provider_url(video.provider_video_id)
+            elif getattr(video, "s3_key", None):
+                video_url = f"/{video_id}/file"
+
+    status_value = video.status.value if hasattr(video.status, "value") else str(video.status)
+
+    return VideoGenerationResponse(
+        id=str(video.id),
+        status=status_value,
+        progress_percentage=video.progress_percentage,
+        error_message=video.error_message,
+        video_url=video_url,
+        thumbnail_url=None,
+        credits_cost=float(video.credits_cost),
+        metadata={
+            "provider": provider_type,
+            "resolution": f"{video.resolution_width}x{video.resolution_height}",
+            "duration": video.duration_seconds,
+            "created_at": video.created_at.isoformat() if video.created_at else None,
+            "completed_at": video.completed_at.isoformat() if video.completed_at else None,
+            "public": True
+        }
+    )
+
+
 # ✅ FIXED: stream file from MinIO/S3
-# - Если есть X-User-ID -> проверяем владельца (как раньше)
-# - Если X-User-ID НЕТ -> разрешаем публичную отдачу (чтобы <video> работал без Bearer)
-# - Поддержка Range для перемотки/seek в браузере
+# - If X-User-ID exists -> check owner
+# - If no X-User-ID -> allow public playback
+# - Range supported
 @app.get("/{video_id}/file")
 async def stream_video_file(video_id: str, current_request: Request, db: Session = Depends(get_db)):
     user_id = current_request.headers.get("X-User-ID")
@@ -462,7 +650,6 @@ async def stream_video_file(video_id: str, current_request: Request, db: Session
     headers = {
         "Accept-Ranges": "bytes",
         "Content-Disposition": f'inline; filename="{video_id}.mp4"',
-        # public playback ok; gateway может поставить свои заголовки
         "Cache-Control": "public, max-age=3600",
     }
 

@@ -3,6 +3,8 @@ version: "3.9"
 services:
   postgres:
     image: postgres:15-alpine
+    shm_size: 256mb
+    mem_limit: 512m
     environment:
       POSTGRES_DB: vide_gen
       POSTGRES_USER: postgres

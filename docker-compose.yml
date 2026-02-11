@@ -12,7 +12,6 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 10s
@@ -42,9 +41,10 @@ services:
       MONGO_INITDB_DATABASE: vide_gen
     healthcheck:
       test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
-      interval: 10s
-      timeout: 5s
+      interval: 30s
+      timeout: 10s
       retries: 5
+      start_period: 20s
 
   # Message Queue
   rabbitmq:
@@ -114,6 +114,7 @@ services:
       MINIO_SECRET_KEY: minioadmin
       MINIO_BUCKET: vide-gen-local
       JWT_SECRET_KEY: dev-secret-key-change-in-production
+      ADMIN_EMAILS: "aibatyr111@gmail.com"
       ENVIRONMENT: development
       DEBUG: "true"
       LOG_LEVEL: INFO
@@ -181,13 +182,16 @@ services:
       DATABASE_URL: postgresql://postgres:password@postgres:5432/vide_gen
       REDIS_URL: redis://redis:6379/2
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-      GOOGLE_AI_API_KEY: AIzaSyBZeMF5vc1fsMmsQ6_jfFzYvYQkl8A97Xk
       WAN_API_KEY: your_wan_api_key_here
 
+      GOOGLE_AI_API_KEY: ${GOOGLE_AI_API_KEY}
+      GOOGLE_API_KEY: ${GOOGLE_AI_API_KEY}      
+      VEO3_API_KEY: ${VEO3_API_KEY}
+      
       MINIO_ENDPOINT: minio:9000
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
-      MINIO_BUCKET: vide-gen-local     
+      MINIO_BUCKET: vide-gen-local
 
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       SORA_API_KEY: ${SORA_API_KEY}

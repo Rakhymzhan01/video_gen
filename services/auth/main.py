@@ -195,10 +195,11 @@ async def register_user(
         background_tasks.add_task(send_verification_email, user.email, verification_token)
         
         # Create tokens
+        subscription = getattr(user.subscription_tier, "value", user.subscription_tier)
         tokens = create_token_pair(
             user_id=user.id,
             email=user.email,
-            subscription_tier=user.subscription_tier.value
+            subscription_tier=subscription,
         )
         
         return TokenResponse(
@@ -209,7 +210,7 @@ async def register_user(
                 username=user.username,
                 first_name=user.first_name,
                 last_name=user.last_name,
-                subscription_tier=user.subscription_tier.value,
+                subscription_tier=subscription,
                 credits_balance=float(user.credits_balance),
                 is_verified=user.is_verified,
                 created_at=user.created_at
@@ -255,10 +256,11 @@ async def login_user(
     db.commit()
     
     # Create tokens
+    subscription = getattr(user.subscription_tier, "value", user.subscription_tier)
     tokens = create_token_pair(
         user_id=user.id,
         email=user.email,
-        subscription_tier=user.subscription_tier.value
+        subscription_tier=subscription,
     )
     
     return TokenResponse(
@@ -269,7 +271,7 @@ async def login_user(
             username=user.username,
             first_name=user.first_name,
             last_name=user.last_name,
-            subscription_tier=user.subscription_tier.value,
+            subscription_tier=subscription,
             credits_balance=float(user.credits_balance),
             is_verified=user.is_verified,
             created_at=user.created_at

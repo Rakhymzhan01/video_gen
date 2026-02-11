@@ -10,9 +10,12 @@ import httpx
 from fastapi import FastAPI, HTTPException, Depends, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import BaseModel, Field
 
-from shared.database.connection import create_tables
-from shared.database.models import User
+from sqlalchemy.orm import Session
+
+from shared.database.connection import create_tables, get_db
+from shared.database.models import User, Content
 from shared.auth.dependencies import get_current_user, get_current_user_optional
 
 app = FastAPI(
@@ -47,7 +50,7 @@ NOTIFICATION_SERVICE_URL = os.getenv("NOTIFICATION_SERVICE_URL", "http://notific
 
 # общий клиент (для JSON/обычных запросов)
 http_client = httpx.AsyncClient(timeout=httpx.Timeout(60.0, read=120.0))
-rate_limit_storage = {}
+rate_limit_storage: Dict[str, List[float]] = {}
 
 
 def _get_cookie_token(request: Request) -> Optional[str]:
@@ -78,9 +81,8 @@ def _scope_has_authorization(scope_headers: List[Tuple[bytes, bytes]]) -> bool:
 @app.middleware("http")
 async def cookie_to_auth_header_middleware(request: Request, call_next):
     """
-    IMPORTANT FIX:
-    Do NOT use request.headers here (it is cached).
-    Work directly with request.scope["headers"].
+    Не трогаем request.headers (там кэш),
+    работаем напрямую с request.scope["headers"].
     """
     scope_headers = list(request.scope.get("headers", []))
 
@@ -110,14 +112,13 @@ async def rate_limiting_middleware(request: Request, call_next):
 
     cutoff_time = current_time - 60
     rate_limit_storage[client_ip] = [
-        timestamp for timestamp in rate_limit_storage.get(client_ip, [])
-        if timestamp > cutoff_time
+        ts for ts in rate_limit_storage.get(client_ip, []) if ts > cutoff_time
     ]
 
     if len(rate_limit_storage.get(client_ip, [])) >= 60:
         return JSONResponse(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            content={"detail": "Rate limit exceeded. Try again later."}
+            content={"detail": "Rate limit exceeded. Try again later."},
         )
 
     if client_ip not in rate_limit_storage:
@@ -142,21 +143,28 @@ async def health_check():
     return {"status": "healthy", "service": "api-gateway", "timestamp": time.time()}
 
 
+@app.get("/api/v1/health")
+async def health_check_v1():
+    return {"status": "healthy", "service": "api-gateway", "timestamp": time.time()}
+
+
 async def forward_request(
     request: Request,
     service_url: str,
     path: str,
-    user: Optional[User] = None
+    user: Optional[User] = None,
 ):
     """
-    Forward request to downstream service.
-    Supports non-JSON (video/mp4, images, etc) responses.
+    Проксирование запроса к микросервису.
+    Поддерживает бинарные ответы (видео, изображения).
     """
     headers = dict(request.headers)
     if user:
         headers["X-User-ID"] = str(user.id)
         headers["X-User-Email"] = user.email
-        headers["X-User-Tier"] = user.subscription_tier.value
+        #headers["X-User-Tier"] = user.subscription_tier.value
+        tier = getattr(user.subscription_tier, "value", user.subscription_tier)
+        headers["X-User-Tier"] = str(tier)
 
     headers.pop("host", None)
     headers.pop("content-length", None)
@@ -166,7 +174,7 @@ async def forward_request(
     params = dict(request.query_params)
 
     try:
-        if request.method in ["POST", "PUT", "PATCH"]:
+        if method in {"POST", "PUT", "PATCH"}:
             content_type = request.headers.get("content-type", "")
 
             if "application/json" in content_type:
@@ -199,7 +207,7 @@ async def forward_request(
             content=resp.content,
             status_code=resp.status_code,
             headers=response_headers,
-            media_type=content_type.split(";")[0] if content_type else None
+            media_type=content_type.split(";")[0] if content_type else None,
         )
 
     except httpx.TimeoutException:
@@ -209,10 +217,11 @@ async def forward_request(
 
 
 def _build_user_headers(user: User) -> Dict[str, str]:
+    tier = getattr(user.subscription_tier, "value", user.subscription_tier)
     return {
         "X-User-ID": str(user.id),
         "X-User-Email": user.email,
-        "X-User-Tier": user.subscription_tier.value,
+        "X-User-Tier": str(tier),
     }
 
 
@@ -225,6 +234,7 @@ def _pass_range_headers(request: Request) -> Dict[str, str]:
     return out
 
 
+# ---------- AUTH ----------
 @app.api_route("/api/v1/auth/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def auth_proxy(request: Request, path: str):
     normalized = path.strip("/").lower()
@@ -233,7 +243,7 @@ async def auth_proxy(request: Request, path: str):
         headers = dict(request.headers)
         headers.pop("host", None)
         headers.pop("content-length", None)
-
+        # логин/refresh всегда без Authorization
         headers.pop("authorization", None)
         headers.pop("Authorization", None)
 
@@ -251,14 +261,14 @@ async def auth_proxy(request: Request, path: str):
         response_headers = dict(resp.headers)
         response_headers.pop("content-length", None)
 
-        data: Any
         if resp.headers.get("content-type", "").startswith("application/json"):
-            data = resp.json()
+            data: Any = resp.json()
         else:
             data = resp.text
 
         out = JSONResponse(content=data, status_code=resp.status_code, headers=response_headers)
 
+        # кладём access_token в куку
         if isinstance(data, dict):
             token = data.get("access_token") or data.get("token")
             if token:
@@ -276,6 +286,7 @@ async def auth_proxy(request: Request, path: str):
     return await forward_request(request, AUTH_SERVICE_URL, f"/{path}")
 
 
+# ---------- IMAGES ----------
 @app.api_route("/api/v1/images/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def images_proxy(request: Request, path: str, user: User = Depends(get_current_user)):
     return await forward_request(request, IMAGE_SERVICE_URL, f"/{path}", user)
@@ -286,6 +297,7 @@ async def view_image_proxy(request: Request, image_id: str, user: Optional[User]
     return await forward_request(request, IMAGE_SERVICE_URL, f"/view/{image_id}", user)
 
 
+# ---------- VIDEOS PUBLIC ----------
 @app.post("/api/v1/videos/generate-public")
 @app.post("/api/v1/videos/generate-public/")
 async def generate_video_public_proxy(
@@ -305,9 +317,6 @@ async def video_status_public_proxy(
     return await forward_request(request, VIDEO_SERVICE_URL, f"/{video_id}/status", user)
 
 
-# ✅ FIX: file endpoint must be PUBLIC-friendly and must NOT depend on /status
-# - user optional
-# - direct stream from video-service /{video_id}/file
 @app.get("/api/v1/videos/{video_id}/file")
 @app.get("/api/v1/videos/{video_id}/file/")
 async def video_file_proxy(
@@ -320,7 +329,6 @@ async def video_file_proxy(
     upstream_headers: Dict[str, str] = {}
     if user:
         upstream_headers.update(_build_user_headers(user))
-
     upstream_headers.update(_pass_range_headers(request))
 
     stream_timeout = httpx.Timeout(60.0, read=3600.0)
@@ -359,17 +367,55 @@ async def video_file_proxy(
     )
 
 
+
 @app.get("/api/v1/videos/providers-public")
 @app.get("/api/v1/videos/providers-public/")
 async def video_providers_public_proxy(request: Request):
     return await forward_request(request, VIDEO_SERVICE_URL, "/providers-public")
 
 
+@app.post("/api/v1/videos/generate")
+async def generate_video(
+    request: Request,
+    user: User = Depends(get_current_user_optional),
+):
+    return await forward_request(
+        request=request,
+        service_url=VIDEO_SERVICE_URL,
+        path="/generate",
+        user=user,
+    )
+
+
+@app.get("/api/v1/videos/{video_id}/status")
+async def get_video_status(
+    request: Request,
+    video_id: str,
+    user: User = Depends(get_current_user_optional),
+):
+    return await forward_request(
+        request=request,
+        service_url=VIDEO_SERVICE_URL,
+        path=f"/{video_id}/status",   
+        user=user,
+    )
+
+
+
+
+
+
+
+
+
+
+# ---------- VIDEOS PRIVATE ----------
 @app.api_route("/api/v1/videos/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def videos_proxy(request: Request, path: str, user: User = Depends(get_current_user)):
     return await forward_request(request, VIDEO_SERVICE_URL, f"/{path}", user)
 
 
+# ---------- BILLING, NOTIFICATIONS, WEBHOOKS ----------
 @app.api_route("/api/v1/billing/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def billing_proxy(request: Request, path: str, user: User = Depends(get_current_user)):
     return await forward_request(request, BILLING_SERVICE_URL, f"/{path}", user)
@@ -385,17 +431,165 @@ async def webhooks_proxy(request: Request, path: str):
     return await forward_request(request, NOTIFICATION_SERVICE_URL, f"/webhooks/{path}")
 
 
+# ---------- USER PROFILE ----------
 @app.get("/api/v1/user/profile")
 async def get_user_profile(user: User = Depends(get_current_user)):
+    tier = getattr(user.subscription_tier, "value", user.subscription_tier)
     return {
         "id": str(user.id),
         "email": user.email,
-        "subscription_tier": user.subscription_tier.value,
+        "subscription_tier": str(tier),
         "credits_balance": float(user.credits_balance),
-        "created_at": user.created_at.isoformat() if user.created_at else None
+        "created_at": user.created_at.isoformat() if user.created_at else None,
     }
 
 
 @app.get("/api/v1/docs/openapi.json")
 async def get_openapi_spec():
     return app.openapi()
+
+
+# ============================================================
+# ADMIN + PUBLIC CONTENT API (без отдельного микросервиса)
+# ============================================================
+
+def _admin_emails_set() -> set[str]:
+    raw = os.getenv("ADMIN_EMAILS", "")
+    return {x.strip().lower() for x in raw.split(",") if x.strip()}
+
+
+def require_admin(user: User = Depends(get_current_user)) -> User:
+    admins = _admin_emails_set()
+    if not admins:
+        # если ADMIN_EMAILS не настроен — лучше не пускать никого
+        raise HTTPException(status_code=403, detail="Admin access is not configured")
+    if user.email.lower() not in admins:
+        raise HTTPException(status_code=403, detail="Admin access denied")
+    return user
+
+
+class ContentIn(BaseModel):
+    section: str = Field(..., min_length=1, max_length=32)
+    lang: str = Field(..., min_length=1, max_length=8)
+    title: str = Field(..., min_length=1, max_length=255)
+    body: str = Field(..., min_length=1)
+    image_data_url: Optional[str] = None
+    video_url: Optional[str] = None
+
+class ContentOut(BaseModel):
+    id: str
+    section: str
+    lang: str
+    title: str
+    body: str
+    image_data_url: Optional[str] = None
+    video_url: Optional[str] = None
+    author_id: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+def _to_out(row: Content) -> ContentOut:
+    return ContentOut(
+        id=str(row.id),
+        section=row.section,
+        lang=row.lang,
+        title=row.title,
+        body=row.body,
+        image_data_url=row.image_data_url,
+        video_url=row.video_url,
+        author_id=str(row.author_id) if row.author_id else None,
+        created_at=row.created_at.isoformat() if row.created_at else None,
+        updated_at=row.updated_at.isoformat() if row.updated_at else None,
+    )
+
+
+@app.get("/api/v1/content", response_model=list[ContentOut])
+async def public_content_list(
+    section: str,
+    lang: str,
+    db: Session = Depends(get_db),
+):
+    rows = (
+        db.query(Content)
+        .filter(Content.section == section, Content.lang == lang)
+        .order_by(Content.updated_at.desc())
+        .all()
+    )
+    return [_to_out(r) for r in rows]
+
+
+@app.get("/api/v1/admin/content", response_model=list[ContentOut])
+async def admin_content_list(
+    section: Optional[str] = None,
+    lang: Optional[str] = None,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    q = db.query(Content)
+    if section:
+        q = q.filter(Content.section == section)
+    if lang:
+        q = q.filter(Content.lang == lang)
+    rows = q.order_by(Content.updated_at.desc()).all()
+    return [_to_out(r) for r in rows]
+
+
+@app.post("/api/v1/admin/content", response_model=ContentOut)
+async def admin_content_create(
+    payload: ContentIn,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    row = Content(
+        section=payload.section,
+        lang=payload.lang,
+        title=payload.title,
+        body=payload.body,
+        image_data_url=payload.image_data_url,
+        video_url=payload.video_url,
+        author_id=admin.id,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return _to_out(row)
+
+
+@app.put("/api/v1/admin/content/{content_id}", response_model=ContentOut)
+async def admin_content_update(
+    content_id: str,
+    payload: ContentIn,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    row = db.query(Content).filter(Content.id == content_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Content not found")
+
+    row.section = payload.section
+    row.lang = payload.lang
+    row.title = payload.title
+    row.body = payload.body
+    row.image_data_url = payload.image_data_url
+    row.video_url = payload.video_url
+    row.author_id = admin.id
+
+    db.commit()
+    db.refresh(row)
+    return _to_out(row)
+
+
+@app.delete("/api/v1/admin/content/{content_id}")
+async def admin_content_delete(
+    content_id: str,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    row = db.query(Content).filter(Content.id == content_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Content not found")
+
+    db.delete(row)
+    db.commit()
+    return {"status": "deleted", "id": content_id}

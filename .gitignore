@@ -39,3 +39,20 @@ worker.py
 # Python
 __pycache__/
 *.pyc
+
+# Node
+node_modules/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+
+# Env / secrets
+.env
+.env.*
+*.log
+
+# Archives
+*.tar.gz
+out.mp4
